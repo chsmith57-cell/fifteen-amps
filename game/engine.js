@@ -1236,10 +1236,10 @@ function upgradeTo(state, m, best) {
     if (!fits || cardBag(m) !== cardBag(best) || !isRunning(m) || powerProblem(state, m)) {
       // Doesn't go in place: sell it and copy the best into the same spot.
       restoreParts(state, keep);
-      const rack = m.rackSlot;
-      const cost = clonePrice(state, best) - machineResale(state, m);
-      if (state.cash < cost) return fail(`You need $${Math.ceil(cost - state.cash).toLocaleString("en-US")} more.`);
       const mine = state.machines.find((x) => x.id === m.id);
+      const rack = mine.rackSlot;
+      const cost = clonePrice(state, best) - machineResale(state, mine);
+      if (state.cash < cost) return fail(`You need $${Math.ceil(cost - state.cash).toLocaleString("en-US")} more.`);
       sellMachine(state, mine.id);
       const r = cloneMachine(state, best.id, { into: typeof rack === "number" ? rack : null });
       if (!r.ok) return fail(r.reason);
@@ -1264,14 +1264,18 @@ function matchTargets(state, best) {
 function applyMatch(state, ids, bestId, ignoreCash = false) {
   let done = 0;
   let last = null;
+  const onTrack = (s) => !s.contract || dealView(s, s.contract).enough;
+  const dealFine = onTrack(state);
   for (const id of ids) {
-    const trial = rehearsalCopy(state);
+    // The trial keeps today's grid emergency and appliance load, and re-picks models the way the real thing will.
+    const trial = { ...rehearsalCopy(state), curtail: state.curtail, spike: state.spike };
     if (ignoreCash) trial.cash = 1e12;
     recompute(trial);
     last = upgradeTo(trial, trial.machines.find((x) => x.id === id), trial.machines.find((x) => x.id === bestId));
     if (!last.ok) break;
-    recompute(trial);
+    optimizeModels(trial);
     if (trial.amps >= safeAmps(trial) * 0.97) { last = { ok: false, reason: "The next one would put more on the circuit than it can safely carry." }; break; }
+    if (dealFine && !onTrack(trial)) { last = { ok: false, reason: "The next one would put your deal behind." }; break; }
     if (!ignoreCash) {
       last = upgradeTo(state, state.machines.find((x) => x.id === id), state.machines.find((x) => x.id === bestId));
       if (!last.ok) break;
@@ -1663,6 +1667,8 @@ export function doMove(state, move, machineId) {
   const fresh = nextMoves(state, machineId ?? state.machines[0]?.id).find((x) => x.id === move.id);
   if (!fresh) return { ok: false, reason: "That move isn't available any more." };
   if (fresh.trips) return { ok: false, reason: `That would trip the breaker at ${fresh.amps.toFixed(1)} A.` };
+  // Prices move while you look. If this costs more than what was shown, buy nothing and show the new price.
+  if (move.cost != null && fresh.cost > move.cost * 1.005 + 1) return { ok: false, stale: true, reason: `That now costs $${Math.round(fresh.cost).toLocaleString("en-US")}, up from $${Math.round(move.cost).toLocaleString("en-US")}. Nothing was bought.` };
   if (state.cash < fresh.cost) return { ok: false, reason: `You need $${Math.ceil(fresh.cost - state.cash).toLocaleString("en-US")} more.` };
   const before = state.cash;
   const done = fresh.run(state);
@@ -1903,7 +1909,7 @@ export function teamBonus(state, id, n = teamCount(state, id)) {
 /** What the next hire adds, as a share: 0.04 is 4%. */
 export const teamNextShare = (state, id) => by(TEAM, id).each * Math.pow(TEAM_FADE, teamCount(state, id));
 /** What the next hire lifts, in dollars a day, against your sales over about the last month, so a quiet week can't buy a cheap team. */
-const teamLift = (state, id) => teamNextShare(state, id) * Math.max(1, state.salesAvg ?? state.stats?.revenuePerDay ?? 0);
+const teamLift = (state, id) => teamNextShare(state, id) * Math.max(1, state.salesRef ?? state.stats?.revenuePerDay ?? 0);
 /** What one more hire would add to profit today, after their pay, tried on a copy. */
 export function teamQuote(state, id) {
   const base = rehearse(state, () => {});
@@ -2046,6 +2052,8 @@ function fillDefaults(state) {
   state.feed ||= 0;
   state.halls ||= 0;
   state.rules ||= { gens: false, market: false, supply: false };
+  // What hires are paid against, until the first tick sets it properly.
+  state.salesRef ??= state.stats?.revenuePerDay || 0;
   state.world ||= { gen: 0, next: null, W: null, boost: {}, orders: [], dock: {} };
   if (ruleOn(state, "market") && !state.world.W) initMarket(state);
   // Orders saved before the monthly record existed still count this month.
@@ -3096,8 +3104,10 @@ function tickStep(state, dt) {
 
   const s = state.stats;
   state.cash += s.profitPerDay * dt;
-  // Sales over about the last month: what people you hire are paid against.
-  state.salesAvg = (state.salesAvg ?? s.revenuePerDay) + (s.revenuePerDay - (state.salesAvg ?? s.revenuePerDay)) * Math.min(1, dt / 30);
+  // Hires are paid against the higher of today's sales and about the last month's, set once a tick: a quiet week can't buy a
+  // cheap team, fast growth can't either, and every quote between ticks agrees.
+  state.salesAvg = (state.salesAvg ?? s.revenuePerDay) + (s.revenuePerDay - (state.salesAvg ?? s.revenuePerDay)) * (1 - Math.exp(-dt / 30));
+  state.salesRef = Math.max(state.salesAvg, s.revenuePerDay);
   state.served += s.mtokPerDay * dt;
   state.earned += s.revenuePerDay * dt;
 

@@ -898,7 +898,7 @@ const slowCache = new Map();
 let slowKey = "";
 function remembered(key, compute) {
   // Prices drift a little every tick, so round them; a loaded model, a hire or a deal changes the answers too.
-  const setup = JSON.stringify([Math.floor(state.day / 5), state.site, state.tech, G.totalRacks(state), Math.round(state.index.gpus * 50), Math.round(state.index.memory * 50), state.racks, state.team, state.research?.levels, state.contract?.tier, state.rules, state.world?.gen, state.machines.map((x) => [x.id, x.chassis, x.board, x.gpus.map((g) => g.id), x.psus, x.memory, x.modelId, x.quant, x.on, x.task])]);
+  const setup = JSON.stringify([Math.floor(state.day / 5), state.site, state.tech, G.totalRacks(state), Math.round(state.index.gpus * 50), Math.round(state.index.memory * 50), state.racks, state.team, state.research?.levels, state.contract?.tier, state.rules, state.world?.gen, state.curtail?.until, state.salesRef && Math.round(Math.log(state.salesRef) * 20), state.rows.map((r) => [r.id, r.racks, r.on, r.tuned, r.modelId]), state.machines.map((x) => [x.id, x.chassis, x.board, x.gpus.map((g) => g.id), x.psus, x.memory, x.modelId, x.quant, x.on, x.task])]);
   if (setup !== slowKey) {
     slowKey = setup;
     slowCache.clear();
