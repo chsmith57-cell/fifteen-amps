@@ -851,7 +851,7 @@ function pickModels(state, withDeal) {
   const memo = new Map();
   const models = allModels(state);
   // Everything a price depends on: a trial that moves the market can't borrow another trial's prices.
-  const pricing = `${state.tech.join()}|${state.techOff || ""}|${state.site}|${state.ownModels.length}|${JSON.stringify(state.research?.levels || {})}|${JSON.stringify(state.rules || {})}|${state.world?.gen || 0}|${Object.values(state.marketF || {}).map((f) => f.toFixed(3))}`;
+  const pricing = `${state.tech.join()}|${state.techOff || ""}|${state.site}|${state.ownModels.length}|${JSON.stringify(state.research?.levels || {})}|${JSON.stringify(state.rules || {})}|${teamCount(state, "sales")}|${teamCount(state, "inference")}|${state.world?.gen || 0}|${Object.values(state.marketF || {}).map((f) => f.toFixed(3))}`;
   const options = (u) => {
     const sig = u.sku ? `sku:${u.sku}` : `${u.gpus.map((g) => g.id)}|${u.memory}|${u.cpu}`;
     const shared = sharedOptions && `${sig}|${pricing}`;
@@ -1144,8 +1144,8 @@ export function cardNeed(state, tier) {
   const toGB = (size) => Math.ceil((size + 1.5) / 1.0737);
   return { rough: toGB(Math.min(...inTier.map((x) => Math.min(...Object.values(x.sizes))))), standard: toGB(Math.min(...inTier.map((x) => x.sizes.Q4 ?? Infinity))) };
 }
-/** The best new machine for one size of model: a standard workstation with 1, 2 or 4 of one card, whichever pays back fastest
- *  on that size, after power, without tripping anything. Tried on copies, so nothing is bought. */
+/** The new machine that pays back fastest on one size of model: a standard workstation with 1, 2 or 4 of one card, with power
+ *  supplies to match, that runs, nets money after power, and trips nothing. Tried on copies, so nothing is bought. */
 export function tierBuild(state, tier) {
   const rack = floorUsed(state) + 1 > floorLimit(state);
   if (rack && rackUnits(state) - rackUsed(state) < 4) return { problem: "No free floor spot or rack space. Buy a rack on the floor's racks tab, or sell a machine." };
@@ -1155,10 +1155,8 @@ export function tierBuild(state, tier) {
       const copy = rehearsalCopy(state);
       copy.cash = 1e12;
       recompute(copy);
-      const r = buildWorkstation(copy, g.id, rack);
-      const m = copy.machines.find((x) => x.id === r.id);
-      for (let i = 1; i < n; i++) buy(copy, "gpus", g.id, m.id);
-      if (m.gpus.length !== n || !isComplete(m)) continue;
+      const m = makeTierMachine(copy, g.id, n, rack);
+      if (!m) continue;
       const cost = 1e12 - copy.cash;
       let pick = null;
       for (const model of allModels(copy).filter((x) => x.tier === tier)) {
@@ -1171,7 +1169,7 @@ export function tierBuild(state, tier) {
       if (!pick) continue;
       loadModel(copy, m.id, pick.model.id, pick.quant);
       recompute(copy);
-      if (copy.amps >= safeAmps(copy) * 0.97) continue;
+      if (!isRunning(m) || copy.amps >= safeAmps(copy) * 0.97) continue;
       const net = pick.perDay - dollarsPerDay(copy, m.output.wall || dcLoad(m) / 0.92);
       if (net <= 0) continue;
       const payback = cost / net;
@@ -1180,17 +1178,133 @@ export function tierBuild(state, tier) {
   }
   return best || { problem: "Nothing you can build here makes money on this size yet." };
 }
-/** Build what tierBuild found, for real, and load its model. */
-export function buildForTier(state, tier) {
+/** A standard workstation with n of one card, adding power supplies as the cards need them. Null if it can't be built to run. */
+function makeTierMachine(state, cardId, n, rack) {
+  const r = buildWorkstation(state, cardId, rack);
+  const m = state.machines.find((x) => x.id === r.id);
+  for (let i = 1; i < n; i++) if (!addGpu(state, m.id, cardId).ok) break;
+  return m.gpus.length === n && isComplete(m) && !powerProblem(state, m) ? m : null;
+}
+/** Build what tierBuild found, for real, and load its model. `quoted` is the price the player saw: if it has moved, nothing is bought. */
+export function buildForTier(state, tier, quoted = null) {
   const plan = tierBuild(state, tier);
   if (plan.problem) return { ok: false, reason: plan.problem };
+  if (quoted != null && Math.abs(plan.cost - quoted) > 1) return { ok: false, reason: `That build now costs $${Math.round(plan.cost).toLocaleString("en-US")}. Nothing was bought; the new price is showing.`, stale: true };
   if (state.cash < plan.cost) return { ok: false, reason: `You need $${Math.ceil(plan.cost - state.cash).toLocaleString("en-US")} more.` };
-  const r = buildWorkstation(state, plan.card.id, plan.rack);
-  const m = state.machines.find((x) => x.id === r.id);
-  for (let i = 1; i < plan.n; i++) buy(state, "gpus", plan.card.id, m.id);
+  const keep = snapshotParts(state);
+  const m = makeTierMachine(state, plan.card.id, plan.n, plan.rack);
+  if (!m) {
+    restoreParts(state, keep);
+    return { ok: false, reason: "That build couldn't be put together. Nothing was bought." };
+  }
   loadModel(state, m.id, plan.model.id, plan.quant);
   recompute(state);
   return { ok: true, id: m.id, plan };
+}
+/** Enough of the game to undo a purchase that went wrong halfway. */
+function snapshotParts(state) {
+  const c = rehearsalCopy(state);
+  return { cash: state.cash, machines: c.machines, racks: c.racks, bench: c.bench, nextId: state.nextId };
+}
+function restoreParts(state, keep) {
+  Object.assign(state, keep);
+  recompute(state);
+}
+
+// ---- Bring every machine up to your best one ----
+const netOf = (state, m) => (m.output?.revenue || 0) - dollarsPerDay(state, m.output?.wall || 0);
+const cardBag = (m) => m.gpus.map((g) => g.id).sort().join();
+/** Your best machine: the most one machine nets a day after its power. */
+export function bestSpec(state) {
+  const live = state.machines.filter((m) => isRunning(m) && m.task === "serve" && m.output?.mtok);
+  return live.sort((a, b) => netOf(state, b) - netOf(state, a))[0] || null;
+}
+/** Make one machine like the best: same model, and the same cards, swapped in place when the case and board allow,
+ *  otherwise sell it and copy the best into its spot. All or nothing: a step that fails puts everything back. */
+function upgradeTo(state, m, best) {
+  const keep = snapshotParts(state);
+  const fail = (reason) => { restoreParts(state, keep); return { ok: false, reason }; };
+  if (cardBag(m) !== cardBag(best)) {
+    const want = best.gpus.map((g) => g.id);
+    for (let i = m.gpus.length - 1; i >= 0; i--) {
+      const k = want.indexOf(m.gpus[i].id);
+      if (k >= 0) want.splice(k, 1);
+      else sellInstalled(state, m.id, "gpus", i);
+    }
+    let fits = true;
+    for (const id of want) if (!addGpu(state, m.id, id).ok) { fits = false; break; }
+    if (!fits || cardBag(m) !== cardBag(best) || !isRunning(m) || powerProblem(state, m)) {
+      // Doesn't go in place: sell it and copy the best into the same spot.
+      restoreParts(state, keep);
+      const rack = m.rackSlot;
+      const cost = clonePrice(state, best) - machineResale(state, m);
+      if (state.cash < cost) return fail(`You need $${Math.ceil(cost - state.cash).toLocaleString("en-US")} more.`);
+      const mine = state.machines.find((x) => x.id === m.id);
+      sellMachine(state, mine.id);
+      const r = cloneMachine(state, best.id, { into: typeof rack === "number" ? rack : null });
+      if (!r.ok) return fail(r.reason);
+      return { ok: true, id: r.id };
+    }
+    if (state.cash < 0) return fail("Not enough cash for the parts.");
+  }
+  if (!loadModel(state, m.id, best.modelId, best.quant)?.ok && m.modelId !== best.modelId) return fail("The model didn't load.");
+  return { ok: true, id: m.id };
+}
+/** Weaker machines, worst first. Machines on a deal, or making the size a deal needs, stay as they are. */
+function matchTargets(state, best) {
+  const top = netOf(state, best);
+  const dealTier = state.contract?.tier;
+  return state.machines
+    .filter((m) => m !== best && isRunning(m) && m.task === "serve" && !m.forDeal && m.output?.model?.tier !== dealTier && netOf(state, m) < top * 0.95)
+    // Same cards and less money means a different model or full buyers, which loading the best model sorts out, not new hardware.
+    .filter((m) => cardBag(m) !== cardBag(best))
+    .sort((a, b) => netOf(state, a) - netOf(state, b));
+}
+/** Upgrade machine by machine, each tried first on a copy: stop at the first that fails, or that would push the site past what's safe. */
+function applyMatch(state, ids, bestId, ignoreCash = false) {
+  let done = 0;
+  let last = null;
+  for (const id of ids) {
+    const trial = rehearsalCopy(state);
+    if (ignoreCash) trial.cash = 1e12;
+    recompute(trial);
+    last = upgradeTo(trial, trial.machines.find((x) => x.id === id), trial.machines.find((x) => x.id === bestId));
+    if (!last.ok) break;
+    recompute(trial);
+    if (trial.amps >= safeAmps(trial) * 0.97) { last = { ok: false, reason: "The next one would put more on the circuit than it can safely carry." }; break; }
+    if (!ignoreCash) {
+      last = upgradeTo(state, state.machines.find((x) => x.id === id), state.machines.find((x) => x.id === bestId));
+      if (!last.ok) break;
+    } else Object.assign(state, { cash: state.cash - (1e12 - trial.cash), machines: trial.machines, racks: trial.racks, bench: trial.bench, nextId: trial.nextId });
+    done++;
+  }
+  return { done, last };
+}
+/** What bringing weaker machines up to the best costs and adds, following the same stopping rules as doing it. */
+export function matchPlan(state) {
+  const best = bestSpec(state);
+  if (!best) return null;
+  const fit = best.output?.fit;
+  const why = `${best.name} nets ${moneyText(netOf(state, best))} a day with ${best.gpus.map((g) => shortName(part("gpus", g.id))).join(" + ")} running ${best.output?.model?.name}${fit ? `, ${fit.label}` : ""}.`;
+  const targets = matchTargets(state, best);
+  if (!targets.length) return { best, why, count: 0, ids: [] };
+  const nets = targets.map((t) => netOf(state, t));
+  const base = rehearse(state, () => {});
+  let done = 0;
+  let stop = null;
+  const after = rehearse(state, (s) => { const r = applyMatch(s, targets.map((t) => t.id), best.id, true); done = r.done; stop = r.last; });
+  if (!base || !after || !done) return { best, why, count: 0, ids: [], stopped: stop?.reason, low: Math.min(...nets), high: Math.max(...nets), waiting: targets.length };
+  const gain = after.profit - base.profit;
+  return { best, why, count: done, waiting: targets.length, stopped: done < targets.length ? stop?.reason : null, ids: targets.slice(0, done).map((t) => t.id), cost: after.cost, gain, payback: gain > 0 ? after.cost / gain : Infinity, low: Math.min(...nets), high: Math.max(...nets) };
+}
+/** Do it for real, worst machine first, as far as the money and the circuit go. */
+export function matchBest(state) {
+  const plan = matchPlan(state);
+  if (!plan?.count) return { ok: false, reason: plan?.stopped || "Every machine already matches your best one." };
+  const { done, last } = applyMatch(state, plan.ids, plan.best.id);
+  if (!done) return last || { ok: false, reason: "Nothing could be upgraded." };
+  optimizeModels(state);
+  return { ok: true, done, of: plan.count };
 }
 
 /** Every useful thing you could do next, tried on a copy of the game and ranked by how fast it pays back. */
@@ -1279,6 +1393,11 @@ function rankMoves(state, machineId) {
       const g = part("gpus", cardId);
       moves.push({ id: `build-${cardId}`, label: `New 4-card workstation with ${shortName(g)}`, run: (st) => buildWorkstation(st, cardId) });
     }
+  }
+  // People: a hire pays back like hardware does, and the next one costs more and adds less.
+  for (const t of TEAM) {
+    const n = teamCount(state, t.id) + 1;
+    moves.push({ id: `team-${t.id}`, label: `Hire an ${t.name.toLowerCase()}${n > 1 ? ` (you have ${n - 1})` : ""}`, unlocks: `Paid ${moneyText(teamNextSalary(state, t.id))} a day. ${t.id === "inference" ? "More tokens from everything you run." : "More buyers in every size, at full price."}`, run: (s) => hireTeam(s, t.id) });
   }
   // Racks, bought turnkey with whatever cooling, switches and halls they need.
   if (fleetUnlocked(state)) {
@@ -1765,6 +1884,51 @@ export const STAFF = [
   { id: "lead", name: "Research lead", hire: 800000, salary: 25000, points: 150, text: "Runs a whole team's agenda." },
   { id: "chief", name: "Chief scientist", hire: 8000000, salary: 150000, points: 2000, text: "Everyone else wants to work for them." },
 ];
+// ---- Your team: people who earn their keep today, not in research points ----
+export const TEAM = [
+  { id: "inference", name: "Inference engineer", each: 0.04, text: "Tunes your serving stack: batching, caching, kernels. More tokens from every machine and rack, which pays when buyers want more than you make." },
+  { id: "sales", name: "Account executive", each: 0.05, text: "Finds and keeps buyers, at full price, unlike a sales deal, which cuts your price. Pays when you make more than buyers want." },
+];
+// Each hire lifts 15% less than the last, so a full team tops out near +27% tokens and +33% buyers. Pay follows the size of the company when they join, so a hire pays back in about
+// 40 days at any size if it fits what's holding you back, and each one more on the same team takes 15% longer.
+const TEAM_FADE = 0.85;
+const TEAM_STEP = 1.15;
+const teamOf = (state, id) => state.team?.[id] || [];
+export const teamCount = (state, id) => teamOf(state, id).length;
+/** The whole team's lift: the first hire adds `each`, every later one 15% less than the one before. */
+export function teamBonus(state, id, n = teamCount(state, id)) {
+  const t = by(TEAM, id);
+  return (t.each * (1 - Math.pow(TEAM_FADE, n))) / (1 - TEAM_FADE);
+}
+/** What the next hire adds, as a share: 0.04 is 4%. */
+export const teamNextShare = (state, id) => by(TEAM, id).each * Math.pow(TEAM_FADE, teamCount(state, id));
+/** What the next hire lifts, in dollars a day, against your sales over about the last month, so a quiet week can't buy a cheap team. */
+const teamLift = (state, id) => teamNextShare(state, id) * Math.max(1, state.salesAvg ?? state.stats?.revenuePerDay ?? 0);
+/** What one more hire would add to profit today, after their pay, tried on a copy. */
+export function teamQuote(state, id) {
+  const base = rehearse(state, () => {});
+  const after = rehearse(state, (s) => hireTeam(s, id));
+  return { cost: teamHireCost(state, id), gain: base && after ? after.profit - base.profit : 0 };
+}
+export const teamHireCost = (state, id) => Math.max(1000, Math.round(30 * teamLift(state, id) * Math.pow(TEAM_STEP, teamCount(state, id))));
+export const teamNextSalary = (state, id) => Math.max(10, Math.round(0.25 * teamLift(state, id)));
+/** Everyone keeps the pay they joined at. */
+export const teamPerDay = (state) => TEAM.reduce((n, t) => n + teamOf(state, t.id).reduce((k, x) => k + x, 0), 0);
+export function hireTeam(state, id) {
+  const cost = teamHireCost(state, id);
+  if (state.cash < cost) return { ok: false, reason: `You need $${Math.ceil(cost - state.cash).toLocaleString("en-US")} more.` };
+  state.cash -= cost;
+  state.team = { ...state.team, [id]: [...teamOf(state, id), teamNextSalary(state, id)] };
+  recompute(state);
+  return { ok: true };
+}
+/** The most recent hire leaves first. */
+export function letGoTeam(state, id) {
+  if (!teamCount(state, id)) return { ok: false, reason: "Nobody in that job." };
+  state.team = { ...state.team, [id]: teamOf(state, id).slice(0, -1) };
+  recompute(state);
+  return { ok: true };
+}
 export const RESEARCH = [
   { id: "speed", name: "Inference engine", each: 0.1, max: 8, text: "Every machine and rack makes 10% more tokens, per level." },
   { id: "price", name: "Model quality", each: 0.06, max: 8, text: "Buyers pay 6% more per token, per level." },
@@ -1816,7 +1980,7 @@ export function research(state, id) {
   return { ok: true };
 }
 export function earnMultiplier(state) {
-  return (hasTech(state, "batch") ? 2.5 : 1) * (hasTech(state, "cache") ? 1.3 : 1) * (hasTech(state, "router") ? 1.3 : 1) * (1 + researchBonus(state, "speed"));
+  return (hasTech(state, "batch") ? 2.5 : 1) * (hasTech(state, "cache") ? 1.3 : 1) * (hasTech(state, "router") ? 1.3 : 1) * (1 + researchBonus(state, "speed")) * (1 + teamBonus(state, "inference"));
 }
 
 /** Sales deals trade price for buyers, so they can lose money. You can always end one. */
@@ -1844,7 +2008,7 @@ export function modelRate(state, model, quant = "Q4") {
 }
 export function tierDemand(state, tier) {
   const grow = 1 + state.day / 500;
-  return TIERS[tier].demand * (0.45 + state.rep * 1.6) * grow * (state.surge[tier]?.mult || 1) * demandMultiplier(state) * (1 + researchBonus(state, "demand")) * (1 + researchBonus(state, tier === "large" || tier === "frontier" ? "reachBig" : "reachSmall"));
+  return TIERS[tier].demand * (0.45 + state.rep * 1.6) * grow * (state.surge[tier]?.mult || 1) * demandMultiplier(state) * (1 + researchBonus(state, "demand")) * (1 + teamBonus(state, "sales")) * (1 + researchBonus(state, tier === "large" || tier === "frontier" ? "reachBig" : "reachSmall"));
 }
 
 function coolingCapacity(state) {
@@ -2097,7 +2261,7 @@ export function recompute(state, ignore = {}) {
   const feed = currentFeed(state);
   const capacityPerDay = feed ? ((feed.amps * volts) / 1e6) * CAPACITY_PER_MW_DAY : 0;
   const supportPerDay = state.rows.reduce((n, r) => n + (skuOf(r).price * r.racks * SUPPORT_PER_YEAR) / 365, 0);
-  const staffPerDay = salaryPerDay(state) + appsPerDay(state);
+  const staffPerDay = salaryPerDay(state) + appsPerDay(state) + teamPerDay(state);
   state.stats = { revenuePerDay: revenue, powerPerDay, capacityPerDay, supportPerDay, staffPerDay, rentPerDay: site(state).rent, mtokPerDay: mtok, soldByTier: sold, profitPerDay: revenue - powerPerDay - capacityPerDay - supportPerDay - staffPerDay - site(state).rent };
 }
 
@@ -2932,6 +3096,8 @@ function tickStep(state, dt) {
 
   const s = state.stats;
   state.cash += s.profitPerDay * dt;
+  // Sales over about the last month: what people you hire are paid against.
+  state.salesAvg = (state.salesAvg ?? s.revenuePerDay) + (s.revenuePerDay - (state.salesAvg ?? s.revenuePerDay)) * Math.min(1, dt / 30);
   state.served += s.mtokPerDay * dt;
   state.earned += s.revenuePerDay * dt;
 

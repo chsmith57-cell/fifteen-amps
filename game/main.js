@@ -865,6 +865,20 @@ function Models({ m }) {
     })}
   </div>`;
 }
+/** Why your machines earn different amounts, and one button to bring the weaker ones up to your best. */
+function MatchBest() {
+  if (state.machines.length < 2) return null;
+  const plan = remembered("matchbest", () => G.matchPlan(state));
+  if (!plan || !plan.waiting) return null;
+  const go = () => { const r = G.matchBest(state); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} of ${r.of} ${r.of === 1 ? "machine" : "machines"} up to ${plan.best.name}'s spec.`); doIt(r); };
+  const short = plan.count && state.cash < plan.cost;
+  const n = plan.count;
+  return html`<div class="matchbest">
+    <p class="small d1">${plan.why} ${plan.waiting} ${plan.waiting === 1 ? "other machine nets" : "others net"} ${plan.waiting === 1 ? moneyShort(plan.low) : `${moneyShort(plan.low)} to ${moneyShort(plan.high)}`} a day.</p>
+    ${n && plan.gain > 0.5 ? html`<button class="act lead" onClick=${go}>bring ${short ? "what you can afford of " : ""}${n === 1 ? "one" : `${n}`} up to ${plan.best.name}: ${money(plan.cost)}, +${moneyShort(plan.gain)} a day, back in ${Math.ceil(plan.payback).toLocaleString("en-US")} days</button>` : n ? html`<p class="small d2">Matching it wouldn't earn more today: buyers for that size are full.</p>` : null}
+    ${plan.stopped ? html`<p class="small d2">${n ? `Stops after ${n}: ` : "Can't match them now: "}${plan.stopped}</p>` : null}
+  </div>`;
+}
 /** When this machine can only run a size split across cards, say why, and offer the best new machine for that size. */
 /** Whether this machine can hold some model of the size whole on one card, where every card works. */
 const holdsWhole = (m, models) => models.some((x) => Object.keys(x.sizes).some((q) => { const f = G.modelFit(state, m, x, q); return f.fits && (f.mode === "single" || f.mode === "copies"); }));
@@ -873,17 +887,18 @@ function TierBuild({ m, tier, models, perCard }) {
   const need = G.cardNeed(state, tier);
   const plan = remembered(`tierbuild|${tier}`, () => G.tierBuild(state, tier));
   const name = G.TIERS[tier].name.toLowerCase();
-  const build = () => { const r = G.buildForTier(state, tier); freshMoves(); if (r.ok) { ui.machineId = r.id; flashNote(`Built ${r.plan.n} x ${G.shortName(r.plan.card)} running ${r.plan.model.name}.`); } doIt(r); };
+  const build = () => { const r = G.buildForTier(state, tier, plan.cost); freshMoves(); if (r.stale) slowKey = ""; if (r.ok) { ui.machineId = r.id; flashNote(`Built ${r.plan.n} x ${G.shortName(r.plan.card)} running ${r.plan.model.name}.`); } doIt(r); };
   return html`<div class="tierbuild">
     <p class="small d1">${G.TIERS[tier].name} models need about ${need.rough} GB on one card at rough quality, ${need.standard} GB at standard. ${perCard ? `This machine's biggest card has ${perCard} GB, so here they'd be split across cards, where only one works at a time and the slowest sets the pace.` : ""}</p>
-    ${plan.problem ? html`<p class="small d2">${plan.problem}</p>` : html`<button class="act lead" disabled=${state.cash < plan.cost} onClick=${build}>build a machine for ${name} models: ${plan.n} x ${G.shortName(plan.card)}, ${money(plan.cost)}, about +${money(plan.perDay)} a day, back in ${Math.ceil(plan.payback)} days</button>${state.cash < plan.cost ? html`<span class="small d2"> ${money(plan.cost - state.cash)} short</span>` : null}`}
+    ${plan.problem ? html`<p class="small d2">${plan.problem}</p>` : html`<button class="act lead" disabled=${state.cash < plan.cost} onClick=${build}>build the machine that pays back fastest on ${name} models: ${plan.n} x ${G.shortName(plan.card)}, ${money(plan.cost)}, about +${money(plan.perDay)} a day, back in ${Math.ceil(plan.payback)} days</button>${state.cash < plan.cost ? html`<span class="small d2"> ${money(plan.cost - state.cash)} short</span>` : null}`}
   </div>`;
 }
 // fitPath and quotes try things on copies of the game, so keep the answer until the setup changes.
 const slowCache = new Map();
 let slowKey = "";
 function remembered(key, compute) {
-  const setup = JSON.stringify([Math.floor(state.day / 5), state.site, state.tech, G.totalRacks(state), state.index, state.racks, state.machines.map((x) => [x.id, x.chassis, x.board, x.gpus.map((g) => g.id), x.psus, x.memory])]);
+  // Prices drift a little every tick, so round them; a loaded model, a hire or a deal changes the answers too.
+  const setup = JSON.stringify([Math.floor(state.day / 5), state.site, state.tech, G.totalRacks(state), Math.round(state.index.gpus * 50), Math.round(state.index.memory * 50), state.racks, state.team, state.research?.levels, state.contract?.tier, state.rules, state.world?.gen, state.machines.map((x) => [x.id, x.chassis, x.board, x.gpus.map((g) => g.id), x.psus, x.memory, x.modelId, x.quant, x.on, x.task])]);
   if (setup !== slowKey) {
     slowKey = setup;
     slowCache.clear();
@@ -1449,6 +1464,7 @@ function Inspector({ items }) {
     const r = it.plan;
     return html`<aside class="inspect">
       <${ItemCard} it=${it} />
+      <${MatchBest} />
       <div class="iverbs">
         ${r.machines.length ? (() => {
           const plan = G.rackCopyPlan(state, r.index);
@@ -1684,6 +1700,25 @@ function Lab({ m }) {
         })}
         ${people.length ? null : html`<span class="labempty small d1">Nobody works here yet.</span>`}
       </div>
+    </section>
+    <section>
+      <h2 class="hd">Your team. People who earn their keep today: ${money(G.teamPerDay(state))} a day in pay.</h2>
+      <p class="small d2" style="margin:0 0 4px">Pay follows the size of your company when someone joins, and they keep it. Each hire in the same job adds a little less than the last.</p>
+      ${(() => {
+        const sold = Object.values(state.stats.soldByTier || {});
+        const unsold = sold.some((v) => v.supply - v.sold > v.supply * 0.02);
+        const short = sold.some((v) => v.demand + (v.toApps || 0) > v.sold * 1.02);
+        const reason = { inference: short ? "Buyers want more, but not yet enough to cover the pay." : "You already make more than buyers take.", sales: unsold ? "Some of what you make goes unsold, but not yet enough to cover the pay." : "Buyers already take everything you make." };
+        return G.TEAM.map((x) => {
+          const n = G.teamCount(state, x.id);
+          const cost = G.teamHireCost(state, x.id);
+          const q = remembered(`team|${x.id}`, () => G.teamQuote(state, x.id));
+          return html`<div class="staff" key=${x.id}>
+            <span><span class="name">${x.name}${n ? `, ${n}` : ""}</span>${n ? html`<span class="d1">, +${Math.round(G.teamBonus(state, x.id) * 100)}% ${x.id === "inference" ? "tokens" : "buyers"} so far</span>` : null}<br /><span class="small d1">${x.text} The next one adds about ${(G.teamNextShare(state, x.id) * 100).toFixed(1)}% for ${money(G.teamNextSalary(state, x.id))} a day.</span><br /><span class=${`small ${q.gain > 0.5 ? "sig" : "d2"}`}>${q.gain > 0.5 ? `Today: +${moneyShort(q.gain)} a day after pay, back in ${Math.ceil(cost / q.gain).toLocaleString("en-US")} days.` : `Today: ${q.gain < -0.5 ? `${moneyShort(-q.gain)} a day worse` : "no better off"} after pay. ${reason[x.id]}`}</span></span>
+            <span class="staffbtn"><button class="act lead" disabled=${state.cash < cost} onClick=${() => { freshMoves(); doIt(G.hireTeam(state, x.id)); }}>hire, ${moneyShort(cost)}</button>${n ? html`<button class="act small" onClick=${() => { freshMoves(); doIt(G.letGoTeam(state, x.id), false); }}>let one go</button>` : null}</span>
+          </div>`;
+        });
+      })()}
     </section>
     <section>
       <h2 class="hd">Your people. ${Math.round(G.pointsPerDay(state)).toLocaleString("en-US")} research points a day, ${money(G.salaryPerDay(state))} a day in salaries.</h2>
@@ -1935,6 +1970,7 @@ function Status2({ m }) {
     <div class="statusrow">
       <section>
         <h2 class="hd">${groups.length ? "Your racks and machines" : "Your machines"}, best first</h2>
+        <${MatchBest} />
         <div class="unitlist">
           ${groups.map((g) => html`<${RowCard} key=${g.key} g=${g} />`)}
           ${designs.map((g) => html`<${MachineGroup} key=${g.key} g=${g} />`)}
