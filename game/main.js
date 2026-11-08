@@ -717,6 +717,10 @@ function buyAndSay(sku, n) {
     flash(r.reason);
     return;
   }
+  if (r.ordered) {
+    flashNote(`Ordered ${n} ${sku.short} ${n === 1 ? "rack" : "racks"}. ${Math.ceil(r.ready - state.day)} days to arrive.`);
+    return;
+  }
   const row = [...state.rows].reverse().find((x) => x.sku === sku.id);
   ui.rowId = row.id;
   ui.modelsRow = row.id;
@@ -893,7 +897,7 @@ function ModelRow({ m, model, best, bestQuant }) {
   return html`<div class=${`model ${cur ? "cur" : ""}`}>
     <div class="mtitle">
       <div class="nm">${cur ? html`<span class="sig">> </span>` : null}${model.name}${best ? html` <span class="tag">pays most on this machine</span>` : null}</div>
-      <div class="small d2">${sparse ? `Sparse: only ${model.active}B of ${Math.round(model.params)}B parameters work per word. Fast, sells cheap.` : model.own ? "Yours." : model.goodAt}</div>
+      <div class="small d2">${sparse ? `Sparse: only ${model.active}B of ${Math.round(model.params)}B parameters work per word. Fast, sells cheap.` : model.own ? "Yours." : model.goodAt}${ageNote(model) ? ` ${ageNote(model)}` : ""}</div>
       ${path ? html`<button class="act" onClick=${follow}>to run it: ${path.label}, ${money(path.cost)}</button>` : !anyFits && !options.some((o) => o.e.fit.fits) ? html`<div class="small d2">Too big for anything you can add here. Sell a machine to free a floor spot, or move up.</div>` : null}
     </div>
     <div class="qs">
@@ -1008,6 +1012,87 @@ function DealStrip() {
   return html`<div class="dealstrip"><span class="sig">${offer.client} offers a deal:</span> <span class="d0">${tok(offer.mtok)} ${G.TIERS[offer.tier].name.toLowerCase()}-model MTok in ${offer.days} days at ${offer.rate}x.</span> <span class=${q.view.enough ? "d1" : "sig"}>${q.view.enough ? "You make enough." : fill ? `Needs ${fill.moves.length} more ${fill.moves.length === 1 ? "machine" : "machines"}.` : "You can't make enough."}</span><span class="d2 small"> ${Math.ceil(offer.expires - state.day)} days to answer.</span>
     ${q.view.enough ? html`<button class="act lead" onClick=${takeWith(false)}>take it</button>` : fill ? html`<button class="act lead" onClick=${takeWith(true)}>take it and give it ${fill.moves.length} ${fill.moves.length === 1 ? "machine" : "machines"}</button>` : null}${see}<button class="act small" onClick=${() => { G.declineContract(state); draw(); }}>pass</button></div>`;
 }
+// ---- The living world ----
+const pct = (f) => `${Math.round(f * 100)}%`;
+const anyRule = () => Object.values(state.rules || {}).some(Boolean);
+function ageNote(model) {
+  if (model.aged) return `${model.aged === 1 ? "A generation" : `${model.aged} generations`} behind: sells for ${pct(Math.pow(G.AGE_PRICE, model.aged))} of its price.`;
+  if (model.gen && G.ruleOn(state, "gens")) return `Generation ${model.gen}'s frontier model.`;
+  return null;
+}
+/** The generation clock, your model's age, what's on order and where prices stand, in a few lines. */
+function WorldStrip({ full = false }) {
+  const w = state.world;
+  // Paid racks on order or at the dock always show, whatever the rules say.
+  if (!w || (!anyRule() && !w.orders?.length && !Object.keys(w.dock || {}).length)) return null;
+  const lines = [];
+  if (G.ruleOn(state, "gens")) {
+    if (w.next) {
+      const days = Math.max(0, Math.ceil(w.next.lands - state.day));
+      lines.push(html`<span class="d0">Generation ${w.gen}.</span> <span class="d1">${w.next.told ? `${G.genSku(w.next.gen).name} and ${G.genModel(w.next.gen).name} land in ${days} days.` : `The next one is announced in ${Math.max(0, days - 150)} days.`}</span>`);
+    } else lines.push(html`<span class="d1">The frontier starts moving once you run a data center.</span>`);
+    const own = G.ownFrontier(state);
+    const units = G.weakerHalf(state);
+    const train = () => { const r = G.startProject(state, "train", units.map((u) => u.id)); freshMoves(); doIt(r); };
+    if (state.project) lines.push(html`<span class="d1">Training: ${pct(state.project.work / state.project.need)} done${state.project.gen > w.gen ? `, aimed at generation ${state.project.gen}` : ""}.</span>`);
+    else if (own && own.aged) {
+      const days = Math.ceil(G.trainingDays(state, "train", units));
+      lines.push(html`<span class="sig">${own.name} is ${own.aged === 1 ? "a generation" : `${own.aged} generations`} old and sells for ${pct(Math.pow(G.AGE_PRICE, own.aged))} of its price.</span> ${units.length ? html`<button class="act lead" onClick=${train}>train a new one on your weaker half, about ${days.toLocaleString("en-US")} days</button>` : null}`);
+    } else if (own && w.next?.told && (own.gen || 0) <= w.gen && units.length) {
+      const days = Math.ceil(G.trainingDays(state, "train", units));
+      lines.push(html`<span class="d1">Train now and your next model lands as generation ${w.next.gen}'s frontier.</span> <button class="act" onClick=${train}>train on your weaker half, about ${days.toLocaleString("en-US")} days</button>`);
+    }
+  }
+  const orders = w.orders || [];
+  if (orders.length) {
+    const n = orders.reduce((k, o) => k + o.n, 0);
+    const soon = Math.min(...orders.map((o) => o.ready));
+    lines.push(html`<span class="d1">On order: ${n} ${n === 1 ? "rack" : "racks"}, the first in ${Math.max(0, Math.ceil(soon - state.day))} days.</span>`);
+  }
+  for (const [id, n] of Object.entries(w.dock || {})) {
+    lines.push(html`<span class="sig">${n} ${G.genSku(id).short} ${n === 1 ? "rack is" : "racks are"} waiting at the dock.</span> <button class="act lead" onClick=${() => { freshMoves(); doIt(G.installDock(state, id)); }}>install ${n === 1 ? "it" : "them"}</button>`);
+  }
+  if (G.ruleOn(state, "market") && state.marketView) {
+    const tiers = Object.entries(state.marketView).filter(([t]) => full || state.stats.soldByTier?.[t]);
+    const off = tiers.filter(([, v]) => Math.abs(v.factor - 1) >= 0.05);
+    if (off.length) lines.push(html`<span class="d1">Prices: ${off.map(([t, v]) => `${G.TIERS[t].name.toLowerCase()} ${pct(v.factor)} of normal`).join(", ")}.</span>`);
+  }
+  if (!lines.length) return null;
+  return html`<div class="worldstrip">${lines.map((l, i) => html`<div key=${i}>${l}</div>`)}</div>`;
+}
+/** A rack that comes in allocations: order it, then it ships on launch day or a month later. */
+function OrderItem({ sku, pre, ready }) {
+  const left = G.allocationLeft(state);
+  const each = Math.round(sku.price * state.index.gpus);
+  const n = Math.min(G.RACKS_PER_ROW, left);
+  const order = (k) => { const r = G.orderRacks(state, sku.id, k); freshMoves(); if (r.ok) flashNote(`Ordered ${k} ${sku.short} ${k === 1 ? "rack" : "racks"}. ${pre ? "They ship on launch day." : "They arrive in 30 days."}`); else flash(r.reason); };
+  const days = Math.max(0, Math.ceil(ready - state.day));
+  return html`<div class="rackitem">
+    <button class=${`item ${left < 1 || state.cash < each ? "off" : ""}`} onClick=${() => order(1)}>
+      <span class="pic"><img src=${art(sku.art)} alt="" loading="lazy" /></span>
+      <span>
+        <span class="name">${sku.name}${pre ? html` <span class="tag">preorder</span>` : null}</span><br />
+        <span class="price">${money(each)}</span>
+        <div class="why">${sku.cards} cards, ${sku.gb} GB each, ${sku.kW} kW, cooled by water</div>
+        <div class="why">${pre ? `Ships on launch day, in ${days} days.` : "Arrives 30 days after you order."} Your allocation has ${left} of ${G.allocation(state)} left this month.</div>
+        <div class="why">Arrives paid for. Floor, cooling and switches are bought when it goes in.</div>
+      </span>
+    </button>
+    ${n > 1 ? html`<button class="act rowbuy" disabled=${state.cash < each * n} onClick=${() => order(n)}>order ${n}, ${money(each * n)}</button>` : null}
+  </div>`;
+}
+/** Switch each living-world rule on or off, for this company. */
+function RulesPanel() {
+  return html`<div class="rules">
+    <h3 class="hd">World rules for this company</h3>
+    ${G.RULES.map((r) => html`<div key=${r.id} class="rule">
+      <button class=${`act ${G.ruleOn(state, r.id) ? "on" : ""}`} onClick=${() => { G.setRule(state, r.id, !G.ruleOn(state, r.id)); freshMoves(); draw(); }}>${r.name}: ${G.ruleOn(state, r.id) ? "on" : "off"}</button>
+      <p class="small d1">${r.text}</p>
+    </div>`)}
+    <p class="small d2">Turning a rule off puts that part back the way it was. Your racks, models and money stay.</p>
+  </div>`;
+}
+
 function UnitBooks() {
   const rows = state.rows.map((r) => { const n = rowNumbers(r); return { key: `r${r.id}`, name: `${r.name}, ${r.racks} ${G.skuOf(r).short}`, what: n.model?.name || "nothing", sales: n.sales, power: n.power, net: n.net, paid: n.spent, open: () => openRow(r) }; });
   const designs = designGroups().map((g) => ({ key: g.key, name: g.list.length > 1 ? `${g.list.length} x ${g.gear}` : g.list[0].name, what: g.model, sales: g.sales, power: g.power, net: g.net, paid: g.paid, group: g, open: () => { ui.machineId = g.list[0].id; ui.layer = "machine"; draw(); } }));
@@ -1035,7 +1120,7 @@ function Market() {
   const units = state.machines.filter(G.isComplete).length + state.rows.length;
   const nets = [...state.machines.filter(G.isComplete).map((x) => G.machineSheet(state, x).net), ...state.rows.map((r) => rowNumbers(r).net)];
   const done = G.MILESTONES.filter((x) => state.milestones.includes(x.id)).length;
-  return html`<div class="wide"><${Ledger} /><div class="cols moneytop">
+  return html`<div class="wide"><${Ledger} /><${WorldStrip} full=${true} /><div class="cols moneytop">
     <section>
       <h2 class="hd">Private deals</h2>
       ${deal ? html`<${DealCard} deal=${deal} />` : null}
@@ -1057,7 +1142,8 @@ function Market() {
       })()}
       ${order.map((t) => {
         const sold = s.soldByTier[t];
-        return html`<div class="line" key=${t}><span class=${sold ? "d0" : "d2"}>${G.TIERS[t].name}, ${moneyAny(G.tierPrice(state, t))} per MTok${state.surge[t] ? ", demand surging" : ""}</span><span class="${sold ? "d1" : "d2"}">${sold ? `you sell ${tok(sold.sold)} of ${tok(sold.demand + (sold.toApps ? G.appDemand(state, t) : 0))} MTok a day${sold.toApps ? `, ${tok(sold.toApps)} to your products` : ""}` : `buyers want ${tok(G.tierDemand(state, t))} MTok a day`}</span></div>`;
+        const mv = G.ruleOn(state, "market") ? state.marketView?.[t] : null;
+        return html`<div class="line" key=${t}><span class=${sold ? "d0" : "d2"}>${G.TIERS[t].name}, ${moneyAny(G.tierPrice(state, t))} per MTok${mv ? `, ${pct(mv.factor)} of normal` : ""}${state.surge[t] ? ", demand surging" : ""}${mv ? html`<br /><span class="small d2">Everyone else makes ${tok(mv.world)} of the ${tok(mv.want)} MTok buyers everywhere want a day${mv.you ? `, and you add ${tok(mv.you)}` : ""}.</span>` : null}</span><span class="${sold ? "d1" : "d2"}">${sold ? `you sell ${tok(sold.sold)} of ${tok(sold.demand + (sold.toApps ? G.appDemand(state, t) : 0))} MTok a day${sold.toApps ? `, ${tok(sold.toApps)} to your products` : ""}` : `buyers want ${tok(G.tierDemand(state, t))} MTok a day`}</span></div>`;
       })}
     </section>
   </div>
@@ -1455,7 +1541,7 @@ function Room() {
   const panels = {
     racks: () => html`
       ${state.rows.length ? html`<div class="switch"><button class="act lead" onClick=${() => { G.optimizeModels(state); freshMoves(); doIt({ ok: true }); }}>load the best model on everything</button>${G.hasTech(state, "powerlimit") ? html`<button class=${`act ${tuned ? "on" : ""}`} onClick=${() => { G.setAllRows(state, "tuned", !tuned); freshMoves(); draw(); }}>power limit on every rack, ${tuned ? "on" : "off"}</button>` : null}</div>` : null}
-      ${big ? html`<h2 class="hd">Whole racks of GPUs, with whatever they need to run</h2><div class="shop">${[...CATALOG.fleetRacks].sort((a, b) => G.skuAvailable(state, b) - G.skuAvailable(state, a) || a.price - b.price).map((sku) => html`<${RackItem} key=${sku.id} sku=${sku} moves=${rankedMoves(machine())} />`)}</div>` : null}
+      ${big ? html`<h2 class="hd">Whole racks of GPUs, with whatever they need to run</h2><${WorldStrip} /><div class="shop">${G.orderable(state).map((o) => html`<${OrderItem} key=${`o-${o.sku.id}`} sku=${o.sku} pre=${o.pre} ready=${o.ready} />`)}${G.fleetRacks(state).filter((sku) => !G.isAllocated(state, sku)).sort((a, b) => G.skuAvailable(state, b) - G.skuAvailable(state, a) || a.price - b.price).map((sku) => html`<${RackItem} key=${sku.id} sku=${sku} moves=${rankedMoves(machine())} />`)}</div>` : null}
       ${here.feeds ? null : html`      <h2 class="hd spaced">Empty racks for machines you build</h2>
       ${state.racks.length ? html`<div style="margin-bottom:10px"><div class="d0">Your racks: ${G.rackUsed(state)} of ${G.rackUnits(state)} units used</div>
         ${rackFree >= 4 ? html`<button class="act lead" onClick=${fillRack}>build a machine for this rack</button>` : html`<div class="small d2">Full. Each rackmount machine takes 4 or 5 units.</div>`}</div>` : null}
@@ -1564,7 +1650,7 @@ function Lab({ m }) {
   const spec = p && G.TRAINING[p.kind];
   const startOne = (kind) => () => doIt(G.startProject(state, kind, [m.id]));
   const startAll = (kind) => () => doIt(G.startProject(state, kind, G.allUnits(state).filter(G.isRunning).map((x) => x.id)));
-  const canStart = (kind) => G.allUnits(state).some((x) => G.isRunning(x) && G.totalVram(x) >= G.TRAINING[kind].minVram);
+  const canStart = (kind) => G.allUnits(state).some((x) => G.isRunning(x) && G.totalVram(x) >= G.trainingSpec(state, kind).minVram);
   const trained = state.ownModels.some((x) => x.tier === "frontier");
   const tuned = state.ownModels.some((x) => x.tier === "medium");
   const tune = G.trainingSpec(state, "finetune");
@@ -1639,6 +1725,7 @@ function Lab({ m }) {
         <div>
           <div class="d0">Train your own model</div>
           <div class="d1">From scratch. It's the whole point of this. Sells at ${G.TRAINING.train.premium}x the frontier price. Needs one machine with ${G.TRAINING.train.minVram} GB, and it goes faster the more you throw at it.</div>
+          ${G.ruleOn(state, "gens") ? html`<div class="small d1">While the frontier moves: aims at generation ${G.targetGen(state)}, about ${Math.ceil(G.trainingDays(state, "train", G.allUnits(state).filter((x) => x.task === "serve" && (x.sku ? x.on : G.isRunning(x))))).toLocaleString("en-US")} days on everything you run, and needs ${G.trainingSpec(state, "train").minVram.toLocaleString("en-US")} GB in one place.</div>` : null}
           <button class="act lead" disabled=${!canStart("train") || !tuned} onClick=${startAll("train")}>start on every machine</button>
           ${!tuned ? html`<div class="small d2">Fine-tune something first.</div>` : null}
         </div>
@@ -1647,9 +1734,10 @@ function Lab({ m }) {
           <div class="d1">This is what a campus is for. It sells at ${G.TRAINING.frontier.premium}x the frontier price, which is the one way to earn more once buyers are full. Needs one rack with ${G.TRAINING.frontier.minVram.toLocaleString("en-US")} GB of linked memory, and every rack you have, for a while.</div>
           <button class="act lead" disabled=${!canStart("frontier")} onClick=${startAll("frontier")}>start on every rack and machine</button>
         </div>` : null}`}
-      ${state.ownModels.length ? html`<h2 class="hd" style="margin-top:22px">Yours</h2>${state.ownModels.map((x) => {
+      ${state.ownModels.length ? html`<h2 class="hd" style="margin-top:22px">Yours</h2>${state.ownModels.map((raw) => {
+        const x = G.allModels(state).find((m) => m.id === raw.id) || raw;
         const use = G.ownModelUse(state, x.id);
-        return html`<div key=${x.id} style="margin-bottom:8px"><div class="sig">${x.name}, ${G.TIERS[x.tier].name.toLowerCase()}, ${x.premium}x price</div><div class="small d1">Running on ${use.on} of your ${use.of} ${use.of === 1 ? "unit" : "machines and racks"}.</div><button class="act" onClick=${() => { const r = G.loadEverywhere(state, x.id); freshMoves(); doIt(r, false); }}>load it on everything that can hold it</button></div>`;
+        return html`<div key=${x.id} style="margin-bottom:8px"><div class="sig">${x.name}, ${G.TIERS[x.tier].name.toLowerCase()}, ${x.premium >= 0.1 ? Math.round(x.premium * 100) / 100 : Number(x.premium.toPrecision(2))}x price${x.aged ? `, ${x.aged === 1 ? "a generation" : `${x.aged} generations`} old` : ""}</div><div class="small d1">Running on ${use.on} of your ${use.of} ${use.of === 1 ? "unit" : "machines and racks"}.</div><button class="act" onClick=${() => { const r = G.loadEverywhere(state, x.id); freshMoves(); doIt(r, false); }}>load it on everything that can hold it</button></div>`;
       })}` : null}
     </section>
   </div></div>`;
@@ -1788,7 +1876,7 @@ function Markets() {
   return html`<section>
     <h2 class="hd">Token markets, per day</h2>
     ${rows.map((r) => html`<button class="mkt" key=${r.tier} onClick=${() => { ui.layer = "models"; draw(); }}>
-      <span class="mktname">${r.name} <span class="d2">${moneyAny(r.price)}${r.change < -0.01 ? `, ${Math.round(r.change * 100)}%` : ""}</span></span>
+      <span class="mktname">${r.name} <span class="d2">${moneyAny(r.price)}${r.world && Math.abs(r.world.factor - 1) >= 0.05 ? `, ${pct(r.world.factor)} of normal` : !r.world && r.change < -0.01 ? `, ${Math.round(r.change * 100)}%` : ""}</span></span>
       <span class="mktbar" aria-hidden="true"><i class="want" style=${`width:${Math.max(1, Math.sqrt(r.demand / top) * 100)}%`}></i><i class=${`made ${r.made > r.demand * 1.02 ? "over" : ""}`} style=${`width:${Math.min(100, Math.sqrt(r.made / top) * 100)}%`}></i></span>
       <span class=${`mktnum ${r.made > r.demand * 1.02 ? "sig" : r.made ? "" : "d2"}`}>${r.made ? `you make ${tokShort(r.made)} of ${tokShort(r.demand)} wanted` : `${tokShort(r.demand)} wanted, you make none`}</span>
     </button>`)}
@@ -1827,6 +1915,7 @@ function Status2({ m }) {
   return html`<div class="wide spaced">
     <${Ledger} />
     <div class="gauges">${sit.rows.map((r) => html`<${Gauge} key=${r.id} r=${r} />`)}</div>
+    <${WorldStrip} />
     <div class="statusrow">
       <section>
         <h2 class="hd">${groups.length ? "Your racks and machines" : "Your machines"}, best first</h2>
@@ -2065,7 +2154,8 @@ function About() {
   return html`<div class="takeover" role="dialog" aria-label="About">
     <h2 style="font-size:clamp(32px,5vw,70px)">About</h2>
     <p>You start with one outlet and an old PC, sell tokens to pay for parts, and work your way up to training your own AI.</p>
-    <p>The parts and models are real, and their specs and rough prices were researched in November 2026. Token prices, demand, events and speed estimates are tuned for fun, and everything in the data center stage, from rack prices to power feeds, is fantasy-tuned around real product names. This is a game, so please don't buy anything because of it.</p>
+    <p>The parts and models are real, and their specs and rough prices were researched in November 2026. Token prices, demand, events and speed estimates are tuned for fun, and everything in the data center stage, from rack prices to power feeds, is fantasy-tuned around real product names. Past Feynman, the racks, labs and models of later generations are made up. This is a game, so please don't buy anything because of it.</p>
+    ${state ? html`<${RulesPanel} />` : null}
     <p class="small d2">Speed calibration uses the Will It Run dataset from specpicks.com (CC BY 4.0). Pixel font is Departure Mono by Helena Zhang (SIL OFL).</p>
     <p class="small d2">Keys: 1 to ${layerList().length} switch screens, space pauses.</p>
     <p class="small d2">Play log: ${playlog.db ? "your clicks and a snapshot of your company go to this game's private database, so Claude can see how a session went." : "not connected in this view."}</p>
@@ -2098,6 +2188,7 @@ function Title() {
       ${saved ? html`<button class="act lead" onClick=${() => start(saved)}>keep going, ${dayName(saved.day).toLowerCase()}, ${money(saved.cash)}</button>` : null}
       <button class=${`act ${saved ? "" : "lead"}`} onClick=${() => start(null)}>${saved ? "start a new company" : "plug it in"}</button>
     </div>
+    ${saved ? null : html`<p class="fine">A new company plays the living world: the frontier moves, prices follow supply, and new chips come in allocations. Switch any of them off in About.</p>`}
     <p class="fine">Run an AI company from your hall closet. Real parts and real models, sold by the million tokens. Watch the breaker. The prices and the economy are made up for fun, so it's a game and not buying advice.</p>
   </main>`;
 }

@@ -63,8 +63,8 @@ export const TRAINING = {
 };
 
 const by = (list, id) => list.find((p) => p.id === id);
-export const part = (kind, id) => by(CATALOG[kind], id);
-export const skuOf = (row) => by(CATALOG.fleetRacks, row.sku);
+export const part = (kind, id) => by(CATALOG[kind], id) || (kind === "fleetRacks" ? genSku(id) : undefined);
+export const skuOf = (row) => part("fleetRacks", row.sku);
 const KIND_LABEL = { gpus: "GPU", cpus: "CPU", boards: "motherboard", memory: "memory", psus: "power supply", coolers: "CPU cooler", storage: "drive", chassis: "case", racks: "rack" };
 export const kindLabel = (k) => KIND_LABEL[k];
 
@@ -121,6 +121,8 @@ export function newGame(seed = Date.now() % 2147483647) {
     nextId: 1,
     stats: { revenuePerDay: 0, powerPerDay: 0, rentPerDay: 0, mtokPerDay: 0, soldByTier: {} },
     pendingName: null,
+    // A new company plays the living world. Saves from before it keep the old rules until they're switched on.
+    rules: { gens: true, market: true, supply: true },
   };
   const m = addMachine(state, "Old gaming PC");
   Object.assign(m, {
@@ -414,10 +416,18 @@ export function loadEverywhere(state, modelId) {
   return { ok: n > 0, count: n, reason: n ? null : "Nothing you own can hold that model." };
 }
 /** Each own model of a kind sells for a little more, and takes longer, than the last. */
-export function trainingSpec(state, kind) {
+export function trainingSpec(state, kind, forGen = null) {
   const spec = TRAINING[kind];
   const made = state.ownModels.filter((x) => x.kind === kind || (!x.kind && x.tier === spec.tier && x.premium === spec.premium)).length;
-  return { ...spec, made, premium: Math.round((spec.premium + made * 0.2) * 10) / 10, work: Math.round(spec.work * Math.pow(1.5, made)) };
+  // A frontier model has to keep up with the generation it lands in: bigger, and more work to train.
+  const moving = ruleOn(state, "gens") && spec.tier === "frontier";
+  // Once the next generation is announced, a new frontier run aims at it: harder, and it stays current a generation longer.
+  const g = moving ? forGen ?? (state.project?.kind === kind && state.project.gen != null ? state.project.gen : targetGen(state)) : 0;
+  const grow = Math.pow(MODEL_GROWTH, g);
+  let work = spec.work * Math.pow(1.5, made);
+  // While the frontier moves, a frontier model costs weeks of a real fleet: so many days of this generation's best rack.
+  if (moving) work = Math.max(work, (kind === "frontier" ? 40000 : 4000) * flagshipPower(g));
+  return { ...spec, made, gen: g, sizeGB: Math.round(spec.sizeGB * grow), minVram: Math.round(spec.minVram * grow), premium: Math.round((spec.premium + made * 0.2) * 10) / 10, work: Math.round(work) };
 }
 export function dollarsPerDay(state, watts) {
   return (watts * 24 * state.centsPerKwh * (site(state).energy || 1) * (1 - researchBonus(state, "power"))) / 100000;
@@ -437,7 +447,7 @@ export function markets(state) {
   return Object.keys(TIERS).map((tier) => {
     const v = state.stats.soldByTier?.[tier];
     const demand = tierDemand(state, tier);
-    return { tier, name: TIERS[tier].name, price: tierPrice(state, tier), change: state.deflation[tier] - 1, demand: demand + appDemand(state, tier), apps: appDemand(state, tier), made: v?.supply || 0, sold: v?.sold || 0 };
+    return { tier, name: TIERS[tier].name, price: tierPrice(state, tier), change: state.deflation[tier] - 1, demand: demand + appDemand(state, tier), apps: appDemand(state, tier), made: v?.supply || 0, sold: v?.sold || 0, world: ruleOn(state, "market") ? state.marketView?.[tier] || null : null };
   });
 }
 export function rackUnits(state) {
@@ -566,7 +576,10 @@ export function estimateEarn(state, m, model, quant = "Q4") {
   const fit = modelFit(state, m, model, quant);
   if (!fit.fits) return { fit, mtok: 0, perDay: 0 };
   const mtok = (fit.tokS * (m.tuned ? 0.94 : 1) * thermalThrottle(state.roomC) * (m.sku ? state.netRatio ?? 1 : 1) * 2 * 86400 * earnMultiplier(state)) / 1e6;
-  const others = allUnits(state).reduce((n, x) => (x !== m && x.output?.model?.tier === model.tier ? n + x.output.mtok : n), 0);
+  const rate = modelRate(state, model, quant);
+  // In the living world buyers take the best-priced tokens first, so only what sells for at least as much is ahead of this.
+  const ranked = rankedSales(state);
+  const others = allUnits(state).reduce((n, x) => (x !== m && x.output?.model?.tier === model.tier && (!ranked || (x.output.rate ?? 0) >= rate) ? n + x.output.mtok : n), 0);
   // Same order as real sales: a deal first, then your products, then the open market.
   const deal = state.contract?.tier === model.tier ? state.contract : null;
   const dealNeed = deal ? dealPerDay(deal, state.day) : 0;
@@ -577,7 +590,6 @@ export function estimateEarn(state, m, model, quant = "Q4") {
   const toApp = Math.min(mtok - toDeal, Math.max(0, appWant - afterDeal));
   const toMarket = Math.min(mtok - toDeal - toApp, Math.max(0, tierDemand(state, model.tier) - Math.max(0, afterDeal - appWant)));
   const sold = toDeal + toApp + toMarket;
-  const rate = modelRate(state, model, quant);
   return { fit, mtok, sold, rate, limitedBy: mtok > sold + 1e-9 ? "buyers" : "speed", perDay: (toDeal * (deal ? deal.rate : 1) + toApp * appMult + toMarket) * rate };
 }
 
@@ -838,7 +850,8 @@ function pickModels(state, withDeal) {
   // Units with the same parts have the same options, so work those out once.
   const memo = new Map();
   const models = allModels(state);
-  const pricing = `${state.tech.join()}|${state.techOff || ""}|${state.site}|${state.ownModels.length}|${JSON.stringify(state.research?.levels || {})}`;
+  // Everything a price depends on: a trial that moves the market can't borrow another trial's prices.
+  const pricing = `${state.tech.join()}|${state.techOff || ""}|${state.site}|${state.ownModels.length}|${JSON.stringify(state.research?.levels || {})}|${JSON.stringify(state.rules || {})}|${state.world?.gen || 0}|${Object.values(state.marketF || {}).map((f) => f.toFixed(3))}`;
   const options = (u) => {
     const sig = u.sku ? `sku:${u.sku}` : `${u.gpus.map((g) => g.id)}|${u.memory}|${u.cpu}`;
     const shared = sharedOptions && `${sig}|${pricing}`;
@@ -857,20 +870,28 @@ function pickModels(state, withDeal) {
     }
     return list;
   };
-  const filled = {};
-  for (const u of allUnits(state)) if (u.output.model) filled[u.output.model.tier] = (filled[u.output.model.tier] || 0) + u.output.mtok;
+  // What each unit sells now. In the living world, only output priced at least as high is ahead of a choice.
+  const ranked = rankedSales(state);
+  const held = new Map();
+  for (const u of allUnits(state)) if (u.output.model) held.set(u, { tier: u.output.model.tier, rate: u.output.rate ?? modelRate(state, u.output.model, u.quant), mtok: u.output.mtok });
+  const fillFor = (tier, rate) => {
+    let n = 0;
+    for (const h of held.values()) if (h.tier === tier && (!ranked || h.rate >= rate)) n += h.mtok;
+    return n;
+  };
   const heat = thermalThrottle(state.roomC);
   const mult = (2 * 86400 * earnMultiplier(state)) / 1e6;
   for (const u of allUnits(state)) {
     if (!isRunning(u) || u.task !== "serve" || u.forDeal) continue;
-    if (u.output.model) filled[u.output.model.tier] -= u.output.mtok;
+    const was = held.get(u);
+    held.delete(u);
     const speed = heat * (u.tuned ? 0.94 : 1) * mult * (u.sku ? (state.netRatio ?? 1) * u.racks : 1);
     let best = null;
     let bestMtok = 0;
     let bestPay = -1;
     for (const o of options(u)) {
       const mtok = o.fit.tokS * speed;
-      const fill = filled[o.model.tier] || 0;
+      const fill = fillFor(o.model.tier, o.rate);
       const deal = withDeal && state.contract && state.contract.tier === o.model.tier ? state.contract : null;
       const dealNeed = deal ? dealPerDay(deal, state.day) : 0;
       const toDeal = Math.min(mtok, Math.max(0, dealNeed - fill));
@@ -891,9 +912,9 @@ function pickModels(state, withDeal) {
       u.quant = best.quant;
       u.output.model = best.model;
       u.output.mtok = bestMtok;
-      filled[best.model.tier] = (filled[best.model.tier] || 0) + bestMtok;
-    } else if (u.output.model) {
-      filled[u.output.model.tier] += u.output.mtok;
+      held.set(u, { tier: best.model.tier, rate: best.rate, mtok: bestMtok });
+    } else if (was) {
+      held.set(u, was);
     }
   }
   recompute(state);
@@ -1196,12 +1217,18 @@ function rankMoves(state, machineId) {
   }
   // Racks, bought turnkey with whatever cooling, switches and halls they need.
   if (fleetUnlocked(state)) {
-    for (const sku of CATALOG.fleetRacks) {
-      if (!skuAvailable(state, sku)) continue;
+    for (const sku of instantRacks(state)) {
       const each = rackPrice(state, sku);
       const n = Math.max(1, Math.min(RACKS_PER_ROW, Math.floor(state.cash / (each * 1.15))));
       moves.push({ id: `rack-${sku.id}`, sku: sku.id, racks: n, label: n === RACKS_PER_ROW ? `Add a row of 8 ${sku.short} racks` : n > 1 ? `Add ${n} ${sku.short} racks` : `Add a ${sku.short} rack`, run: (s) => buyRacks(s, sku.id, n) });
     }
+  }
+  // The newest racks come by order. Priced as if they were running today, which is as far as the status page can see.
+  for (const o of orderable(state)) {
+    const each = Math.round(o.sku.price * state.index.gpus);
+    const n = Math.max(1, Math.min(RACKS_PER_ROW, allocationLeft(state), Math.floor(state.cash / (each * 1.15))));
+    if (!allocationLeft(state)) continue;
+    moves.push({ id: `order-${o.sku.id}`, label: `Order ${n} ${o.sku.short} ${n === 1 ? "rack" : "racks"}`, unlocks: o.pre ? `They ship on launch day, in ${Math.ceil(o.ready - state.day)} days. The number shows them running.` : `They arrive in ${LEAD_DAYS} days. The number shows them running.`, run: (s) => orderRacks(s, o.sku.id, n), forecast: (s) => installRacks(s, o.sku, n, null, each * n) });
   }
   if ((state.netRatio ?? 1) < 1) {
     const short = fabricNeed(state) - fabricCapacity(state);
@@ -1220,8 +1247,8 @@ function rankMoves(state, machineId) {
   if (state.rows.length && (state.capFactor ?? 1) < 0.999 && !state.curtail) {
     const perKw = (r) => (r.output?.revenue || 0) / (skuOf(r).kW * r.racks);
     const worst = [...state.rows].sort((a, b) => perKw(a) - perKw(b))[0];
-    for (const sku of CATALOG.fleetRacks) {
-      if (sku.price <= skuOf(worst).price || !skuAvailable(state, sku)) continue;
+    for (const sku of instantRacks(state)) {
+      if (sku.price <= skuOf(worst).price) continue;
       moves.push({ id: `swaprow-${sku.id}`, label: `Swap ${worst.name} for ${worst.racks} ${sku.short} racks`, run: (s) => {
         const n = worst.racks;
         const trial = rehearsalCopy(s);
@@ -1342,7 +1369,9 @@ function rankMoves(state, machineId) {
   // Sales deals cut the price today and pay only once there are racks to sell into the new demand.
   const buyersFull = Object.values(state.stats.soldByTier || {}).some((v) => v.supply - v.sold > v.supply * 0.02);
   if (buyersFull) {
-    const fills = CATALOG.fleetRacks.filter((x) => skuAvailable(state, x)).slice(-2);
+    // Fill new buyers with the two racks that already pay back fastest, whatever generation they're from.
+    const paying = out.filter((x) => x.id.startsWith("rack-") && x.payback < Infinity).sort((x, y) => x.payback - y.payback).map((x) => part("fleetRacks", x.sku));
+    const fills = paying.length ? paying.slice(0, 2) : instantRacks(state);
     for (const t of TECH) {
       if (!t.demand || hasTech(state, t.id) || !techAvailable(state, t)) continue;
       const i = out.findIndex((x) => x.id === `tech-${t.id}`);
@@ -1354,12 +1383,12 @@ function rankMoves(state, machineId) {
   const instantFeed = (s) => { const go = orderFeed(s); if (go.ok) { s.feed = s.feedOrder.index; s.feedOrder = null; } };
   if (feedNext && !state.feedOrder) {
     const mw = (feedNext.amps * site(state).volts) / 1e6;
-    bundled("feed", `Sign for ${feedNext.amps} A, ${mw.toFixed(1)} MW`, instantFeed, CATALOG.fleetRacks.filter((x) => skuAvailable(state, x)), `The power takes ${feedNext.days} days to arrive, so this pays after that`, [], null, (s) => orderFeed(s));
+    bundled("feed", `Sign for ${feedNext.amps} A, ${mw.toFixed(1)} MW`, instantFeed, instantRacks(state), `The power takes ${feedNext.days} days to arrive, so this pays after that`, [], null, (s) => orderFeed(s));
   }
   if (next && next.feeds) {
     const mw = (next.feeds[0].amps * next.volts) / 1e6;
     const preview = { ...state, site: next.id };
-    bundled("site", `Move to the ${next.name.toLowerCase()}`, (s) => moveSite(s), CATALOG.fleetRacks.filter((x) => skuAvailable(preview, x)), `${mw.toFixed(1)} MW, cheaper power, ${next.floor} rack spots`, TECH.filter((t) => t.site === next.id && !hasTech(state, t.id)), null);
+    bundled("site", `Move to the ${next.name.toLowerCase()}`, (s) => moveSite(s), instantRacks(state, preview), `${mw.toFixed(1)} MW, cheaper power, ${next.floor} rack spots`, TECH.filter((t) => t.site === next.id && !hasTech(state, t.id)), null);
   }
   // The best upgrades for a kind of machine also get priced across all of them, since a market can fill partway through.
   const tried = {};
@@ -1416,6 +1445,7 @@ function rehearsalCopy(state) {
     contract: state.contract ? { ...state.contract } : null,
     offer: null,
     project: state.project ? { ...state.project } : null,
+    world: copyWorld(state.world),
   };
 }
 /** Try something on a copy of the game with models re-chosen and the room settled, and report the result. */
@@ -1531,8 +1561,19 @@ export function sellFromBench(state, key) {
   state.bench = state.bench.filter((b) => b !== item);
 }
 
+const modelMemo = new WeakMap();
+/** Every model you could load. While the frontier moves, an older frontier model sells for half the price per generation behind. */
 export function allModels(state) {
-  return [...CATALOG.models, ...state.ownModels];
+  const gen = state.world?.gen || 0;
+  const on = ruleOn(state, "gens");
+  const memo = modelMemo.get(state.ownModels);
+  if (memo && memo.gen === gen && memo.on === on && memo.len === state.ownModels.length) return memo.list;
+  const list = [...CATALOG.models, ...releasedModels(gen), ...state.ownModels].map((m) => {
+    const aged = on && m.tier === "frontier" ? gen - (m.gen || 0) : 0;
+    return aged > 0 ? { ...m, aged, premium: (m.premium || 1) * Math.pow(AGE_PRICE, aged) } : m;
+  });
+  modelMemo.set(state.ownModels, { gen, on, len: state.ownModels.length, list });
+  return list;
 }
 
 /** Everything the UI needs to know about loading one model on one machine. */
@@ -1727,7 +1768,7 @@ export function demandMultiplier(state) {
 export function wholesaleCut(state) {
   return TECH.reduce((n, t) => (t.wholesale && techActive(state, t.id) ? n * t.wholesale : n), 1);
 }
-export const tierPrice = (state, tier) => TIERS[tier].price * state.deflation[tier] * wholesaleCut(state) * (1 + researchBonus(state, "price"));
+export const tierPrice = (state, tier) => TIERS[tier].price * state.deflation[tier] * wholesaleCut(state) * (1 + researchBonus(state, "price")) * marketFactor(state, tier);
 /** How much of the model works on each token. Measured sparse (MoE) models run about 4x faster, not the full ratio. */
 export function sparseRatio(model) {
   return model.moe && model.active ? Math.max(0.22, model.active / model.params) : 1;
@@ -1775,6 +1816,11 @@ function fillDefaults(state) {
   state.network ||= [];
   state.feed ||= 0;
   state.halls ||= 0;
+  state.rules ||= { gens: false, market: false, supply: false };
+  state.world ||= { gen: 0, next: null, W: null, boost: {}, orders: [], dock: {} };
+  if (ruleOn(state, "market") && !state.world.W) initMarket(state);
+  // Orders saved before the monthly record existed still count this month.
+  state.world.placed ||= state.world.orders.filter((o) => o.placed > state.day - 30).map((o) => ({ day: o.placed, n: o.n }));
   // Old saves never stored which rack a machine sits in. Lock in today's layout before a preview can disturb it.
   if (state.racks?.length && state.machines.some((m) => m.rackSlot === undefined && m.chassis && part("chassis", m.chassis).type === "rackmount")) rackPlan(state);
 }
@@ -1815,6 +1861,12 @@ export function recompute(state, ignore = {}) {
   // Sell into each tier's market, contract first. Unsold capacity sits idle and draws less power.
   // c is how far the power contract lets racks run, so whatever it holds back never gets sold in the first place.
   const leased = hasTech(state, "lease");
+  // In the living world a full market buys the best-priced tokens first, so each unit sells, and draws, for its own place in line.
+  const ranked = rankedSales(state);
+  for (const list of Object.values(supply)) {
+    for (const m of list) m.output.rate = modelRate(state, m.output.model, m.quant);
+    if (ranked) list.sort((a, b) => b.output.rate - a.output.rate);
+  }
   const sellAt = (c) => {
     const out = {};
     for (const [tier, list] of Object.entries(supply)) {
@@ -1825,7 +1877,19 @@ export function recompute(state, ignore = {}) {
       const toContract = Math.min(total, contractNeed);
       const toApps = Math.min(total - toContract, appDemand(state, tier));
       const market = Math.min(total - toContract - toApps, demand);
-      out[tier] = { total, demand, contract, toContract, toApps, market, util: total ? (toContract + toApps + market) / total : 0 };
+      const util = total ? (toContract + toApps + market) / total : 0;
+      let utilOf = null;
+      if (ranked) {
+        utilOf = new Map();
+        let left = toContract + toApps + market;
+        for (const m of list) {
+          const made = m.output.mtok * (m.sku ? c : 1);
+          const take = Math.min(made, left);
+          left -= take;
+          utilOf.set(m, made ? take / made : 0);
+        }
+      }
+      out[tier] = { total, demand, contract, toContract, toApps, market, util, utilOf };
     }
     return out;
   };
@@ -1842,7 +1906,7 @@ export function recompute(state, ignore = {}) {
   };
   const drawAt = (c) => {
     const sales = sellAt(c);
-    const busy = (u) => (u.task !== "serve" || leased ? 1 : u.output.mtok ? sales[u.output.model.tier].util : 0);
+    const busy = (u) => (u.task !== "serve" || leased ? 1 : u.output.mtok ? sales[u.output.model.tier].utilOf?.get(u) ?? sales[u.output.model.tier].util : 0);
     let machineW = 0;
     let rackAir = 0;
     let rackWet = 0;
@@ -1910,16 +1974,28 @@ export function recompute(state, ignore = {}) {
   let mtok = 0;
   const sold = {};
   const sales = sellAt(1);
+  if (ruleOn(state, "market") && state.world?.W) setMarket(state, sales);
   for (const [tier, list] of Object.entries(supply)) {
     const { total, demand, contract, toContract, toApps, market, util } = sales[tier];
     const appMult = APPS.find((a) => a.tier === tier)?.mult || 1;
     sold[tier] = { supply: total, demand, sold: toContract + toApps + market, toContract, toApps };
-    for (const m of list) {
-      const share = total ? m.output.mtok / total : 0;
-      m.output.util = util;
-      m.output.rate = modelRate(state, m.output.model, m.quant);
-      m.output.revenue = (market + toApps * appMult + toContract * (contract ? contract.rate : 1)) * share * m.output.rate;
-      revenue += m.output.revenue;
+    const paid = market + toApps * appMult + toContract * (contract ? contract.rate : 1);
+    for (const m of list) m.output.rate = modelRate(state, m.output.model, m.quant);
+    if (ranked) {
+      // The best-priced tokens sell first, so an old model can't crowd out a new one.
+      const all = toContract + toApps + market;
+      for (const m of list) {
+        m.output.util = sales[tier].utilOf.get(m) ?? 0;
+        m.output.revenue = all ? (paid / all) * m.output.mtok * m.output.util * m.output.rate : 0;
+        revenue += m.output.revenue;
+      }
+    } else {
+      for (const m of list) {
+        const share = total ? m.output.mtok / total : 0;
+        m.output.util = util;
+        m.output.revenue = paid * share * m.output.rate;
+        revenue += m.output.revenue;
+      }
     }
     mtok += toContract + toApps + market;
   }
@@ -1960,10 +2036,262 @@ export function recompute(state, ignore = {}) {
   state.stats = { revenuePerDay: revenue, powerPerDay, capacityPerDay, supportPerDay, staffPerDay, rentPerDay: site(state).rent, mtokPerDay: mtok, soldByTier: sold, profitPerDay: revenue - powerPerDay - capacityPerDay - supportPerDay - staffPerDay - site(state).rent };
 }
 
+// ---- The living world: three rules, each switchable on its own (DESIGN.md, "A living world") ----
+export const RULES = [
+  { id: "gens", name: "The frontier moves", text: "Once you run a data center, a new generation lands about every 600 days. Each brings a bigger frontier model and a faster rack. Older frontier models, yours included, sell for half their price per generation behind, and older racks cost less to buy and fetch less when sold." },
+  { id: "market", name: "A living market", text: "Token prices come from supply and demand. Everyone else builds when prices run high and leaves slowly when they're low, and what you sell moves the price too." },
+  { id: "supply", name: "Chips are allocated", text: "The newest rack comes in allocations: order before it ships to get it on day one, or after, and wait a month. Each month you can order about a tenth of the racks you run." },
+];
+export const ruleOn = (state, id) => !!state.rules?.[id];
+/** Under any living-world rule, a full market buys the best-priced tokens first; classic splits buyers evenly. */
+const rankedSales = (state) => ruleOn(state, "gens") || ruleOn(state, "market");
+const GEN_DAYS = 600;
+const ANNOUNCE_DAYS = 150;
+const FIRST_GEN_DAYS = 200;
+const MODEL_GROWTH = 1.4;
+export const AGE_PRICE = 0.5;
+const LEAD_DAYS = 30;
+// Buyers everywhere, in MTok a day, against each size's base demand. Late in a run you can be a big slice of it.
+const WORLD_SCALE = 170;
+const ELASTICITY = 1.5;
+const BUILD_RATE = 0.012;
+const LEAVE_RATE = 0.002;
+const WORLD_FLOOR = 0.15;
+// Rubin Ultra and Feynman are real names on real roadmaps. Their numbers here, and everything after them, are made up.
+const RACK_NAMES = [["Rubin Ultra NVL144", "Rubin Ultra"], ["Feynman NVL144", "Feynman"], ["Noether NVL144", "Noether"], ["Dirac NVL144", "Dirac"], ["Meitner NVL144", "Meitner"], ["Shannon NVL144", "Shannon"], ["Bohr NVL144", "Bohr"], ["Euler NVL144", "Euler"]];
+const LABS = ["Halcyon", "Meridian", "Corvid", "Tessera", "Northstar", "Lattice"];
+const genRacks = new Map();
+const genModels = new Map();
+/** The flagship rack generation g brings, as a catalog entry. Its id is all a save stores. */
+export function genSku(id) {
+  const g = typeof id === "number" ? id : Number(/^gen(\d+)-rack$/.exec(id || "")?.[1]);
+  if (!(g >= 1)) return undefined;
+  if (!genRacks.has(g)) {
+    const [name, short] = RACK_NAMES[g - 1] || [`Gen ${g} NVL144`, `Gen ${g}`];
+    genRacks.set(g, {
+      id: `gen${g}-rack`, gen: g, name, short, vendor: "nvidia", art: "rack-rubin", cards: 144, domain: 144, liquid: 1, site: "datacenter",
+      gb: Math.round(288 * Math.pow(1.5, g)), bandwidth: Math.round(22000 * Math.pow(1.5, g)), kW: Math.round(400 * Math.pow(1.1, g - 1)),
+      fabricTb: Math.round(230.4 * Math.pow(1.4, g - 1) * 10) / 10, price: Math.round((21e6 * Math.pow(1.15, g - 1)) / 1e5) * 1e5,
+      blurb: `Generation ${g}: 144 cards linked as one, each faster and roomier than the last generation's.`,
+    });
+  }
+  return genRacks.get(g);
+}
+/** The frontier model generation g brings: an efficient sparse model like MiniMax M3, bigger every time, so it runs best on that generation's racks. */
+export function genModel(g) {
+  if (!genModels.has(g)) {
+    const params = Math.round(428 * Math.pow(MODEL_GROWTH, g));
+    const size = (k) => Math.round(params * k * 100) / 100;
+    genModels.set(g, { id: `gen${g}-model`, name: `${LABS[(g - 1) % LABS.length]} ${g + 1}`, maker: LABS[(g - 1) % LABS.length], tier: "frontier", gen: g, params, active: Math.round(23 * Math.pow(MODEL_GROWTH, g)), moe: true, sizes: { Q2: size(0.336), Q4: size(0.619), Q8: size(1.06) }, goodAt: `generation ${g}'s frontier` });
+  }
+  return genModels.get(g);
+}
+/** One day of the generation's best rack, in training work. Generation 0's best is Vera Rubin. */
+function flagshipPower(g) {
+  const sku = g >= 1 ? genSku(g) : CATALOG.fleetRacks.find((x) => x.id === "vera-rubin-nvl72");
+  return sku.cards * sku.bandwidth;
+}
+/** The generation a frontier training run started now would land in. */
+export const targetGen = (state) => (state.world?.next?.told ? state.world.next.gen : state.world?.gen || 0);
+const releasedModels = (gen) => Array.from({ length: gen }, (_, i) => genModel(i + 1));
+function copyWorld(w) {
+  if (!w) return w;
+  return { ...w, next: w.next ? { ...w.next } : null, W: w.W ? { ...w.W } : null, boost: { ...w.boost }, orders: w.orders.map((o) => ({ ...o })), dock: { ...w.dock }, placed: [...(w.placed || [])] };
+}
+
+/** How many tokens of a size buyers everywhere want a day, at the normal price. */
+export function worldDemand(state, tier) {
+  return TIERS[tier].demand * WORLD_SCALE * (1 + state.day / 500) * (state.world?.boost?.[tier] || 1);
+}
+export const marketFactor = (state, tier) => (ruleOn(state, "market") ? state.marketF?.[tier] ?? 1 : 1);
+/** Price follows buyers over everyone's supply, yours included. Contracts and your products aren't on the open market. */
+function setMarket(state, sales) {
+  const f = {};
+  const view = {};
+  for (const tier of Object.keys(TIERS)) {
+    const M = worldDemand(state, tier);
+    const W = state.world.W[tier] ?? M;
+    const Y = sales[tier]?.market || 0;
+    f[tier] = Math.min(3, Math.max(0.3, Math.pow(M / Math.max(1, W + Y), 1 / ELASTICITY)));
+    view[tier] = { want: M, world: W, you: Y, factor: f[tier] };
+  }
+  state.marketF = f;
+  state.marketView = view;
+}
+/** Start everyone else where today's prices already balance, so switching the market on changes nothing until something moves. */
+function initMarket(state) {
+  const W = {};
+  for (const tier of Object.keys(TIERS)) {
+    const v = state.stats?.soldByTier?.[tier];
+    const yours = v ? Math.max(0, v.sold - (v.toContract || 0) - (v.toApps || 0)) : 0;
+    let M = worldDemand(state, tier);
+    // A company already bigger than the market it sells into gets a market its size, so nothing jumps.
+    if (yours > (1 - WORLD_FLOOR) * M) {
+      const grow = yours / (1 - WORLD_FLOOR) / M;
+      state.world.boost = { ...state.world.boost, [tier]: (state.world.boost?.[tier] || 1) * grow };
+      M *= grow;
+    }
+    W[tier] = Math.max(WORLD_FLOOR * M, M - yours);
+  }
+  state.world.W = W;
+}
+
+/** About a tenth of the racks you run, every month, and never fewer than four. */
+export const allocation = (state) => state.world?.allot || Math.max(4, Math.round(totalRacks(state) * 0.1));
+/** Only the newest rack is allocated, and the one announced after it. Everything older is in stock. */
+export const isAllocated = (state, sku) => ruleOn(state, "supply") && !!sku?.gen && sku.gen >= (state.world?.gen || 0);
+/** Racks of the allocated kind ordered in the last 30 days count against this month's share. */
+export function allocationLeft(state) {
+  const recent = (state.world?.placed || []).filter((o) => o.day > state.day - 30).reduce((n, o) => n + o.n, 0);
+  return Math.max(0, allocation(state) - recent);
+}
+/** What can be ordered right now: the newest released rack, and the next one once it's announced. */
+export function orderable(state) {
+  const w = state.world;
+  if (!ruleOn(state, "supply") || !w) return [];
+  const list = [];
+  if (w.gen >= 1 && siteAtLeast(state, "datacenter")) list.push({ sku: genSku(w.gen), ready: state.day + LEAD_DAYS, pre: false });
+  if (w.next?.told && siteAtLeast(state, "datacenter")) list.push({ sku: genSku(w.next.gen), ready: w.next.lands, pre: true });
+  return list;
+}
+export function orderRacks(state, skuId, n = 1) {
+  const can = orderable(state).find((x) => x.sku.id === skuId);
+  if (!can) return { ok: false, reason: "You can't order that rack right now." };
+  if (n > allocationLeft(state)) return { ok: false, reason: `Your allocation this month has ${allocationLeft(state)} left.` };
+  const cost = Math.round(can.sku.price * state.index.gpus) * n;
+  if (state.cash < cost) return { ok: false, reason: `You need $${Math.ceil(cost - state.cash).toLocaleString("en-US")} more.` };
+  state.cash -= cost;
+  state.world.orders.push({ id: state.nextId++, sku: skuId, n, placed: state.day, ready: can.ready, paid: cost });
+  // What you ordered this month counts against the allocation even after it arrives.
+  state.world.placed = [...(state.world.placed || []).filter((o) => o.day > state.day - 30), { day: state.day, n }];
+  say(state, `ORDERED ${n} ${can.sku.short.toUpperCase()} ${n === 1 ? "RACK" : "RACKS"}. ${can.pre ? "THEY SHIP ON LAUNCH DAY" : `THEY ARRIVE IN ${LEAD_DAYS} DAYS`}.`, "info");
+  recompute(state);
+  return { ok: true, ordered: true, ready: can.ready };
+}
+/** Racks that have arrived go straight in when there's room and money to cable them, or wait at the dock. */
+function deliver(state, order) {
+  const w = state.world;
+  w.orders = w.orders.filter((o) => o !== order);
+  const sku = genSku(order.sku);
+  // A delivery never sells anything to make room, and never goes in where that rack can't run.
+  const plan = siteAtLeast(state, sku.site) ? provisionPlan(state, sku, order.n) : null;
+  const r = !plan ? { ok: false, reason: `It needs a ${by(SITES, sku.site).name.toLowerCase()}.` } : plan.retire.length ? { ok: false, reason: "There's no free floor without selling a machine." } : installRacks(state, sku, order.n, plan, 0);
+  if (r.ok) say(state, `${order.n} ${sku.short.toUpperCase()} ${order.n === 1 ? "RACK" : "RACKS"} ARRIVED AND WENT IN.`, "good");
+  else {
+    w.dock[order.sku] = (w.dock[order.sku] || 0) + order.n;
+    say(state, `${order.n} ${sku.short.toUpperCase()} ${order.n === 1 ? "RACK IS" : "RACKS ARE"} WAITING AT THE DOCK. ${r.reason.toUpperCase()}`, "bad");
+  }
+}
+/** Install racks waiting at the dock. They're paid for; the room, cooling and switches aren't. */
+export function installDock(state, skuId) {
+  const n = state.world?.dock?.[skuId] || 0;
+  if (!n) return { ok: false, reason: "Nothing is waiting at the dock." };
+  const sku = genSku(skuId);
+  if (!siteAtLeast(state, sku.site)) return { ok: false, reason: `${sku.short} racks need a ${by(SITES, sku.site).name.toLowerCase()}.` };
+  const r = installRacks(state, sku, n, null, 0);
+  if (r.ok) delete state.world.dock[skuId];
+  return r;
+}
+
+/** Queue the next generation. Switched on in a running company, the first is announced at once; reached naturally, a new data center gets a full generation to grow first. */
+function scheduleGen(state, first) {
+  const w = state.world;
+  w.next = { gen: w.gen + 1, lands: state.day + (first ? FIRST_GEN_DAYS : GEN_DAYS), told: false };
+  if (first) announceGen(state);
+}
+function announceGen(state) {
+  const w = state.world;
+  w.next.told = true;
+  // The allocation is set when a generation is announced, from the racks you run then, so buying more doesn't snowball it.
+  w.allot = Math.max(4, Math.round(state.rows.reduce((n, r) => n + (r.on ? r.racks : 0), 0) * 0.1));
+  const sku = genSku(w.next.gen);
+  const model = genModel(w.next.gen);
+  say(state, `${sku.name.toUpperCase()} ANNOUNCED. IT SHIPS IN ${Math.round(w.next.lands - state.day)} DAYS WITH ${model.name.toUpperCase()}, A BIGGER FRONTIER MODEL.${ruleOn(state, "supply") ? " ORDERS ARE OPEN." : ""}`, "info");
+}
+function landGen(state) {
+  const w = state.world;
+  w.gen = w.next.gen;
+  w.next = null;
+  const sku = genSku(w.gen);
+  const model = genModel(w.gen);
+  // Preorders ship on launch day, whenever that turns out to be.
+  for (const o of w.orders) if (genSku(o.sku).gen === w.gen) o.ready = Math.min(o.ready, state.day);
+  if (ruleOn(state, "market") && w.W) {
+    // New things to build bring buyers, and half the world's racks can't keep up with the new model yet.
+    w.boost = { ...w.boost, frontier: (w.boost.frontier || 1) * 1.1 };
+    w.W.frontier *= 0.5;
+  }
+  say(state, `GENERATION ${w.gen}: ${model.name.toUpperCase()} IS THE NEW FRONTIER AND ${sku.short.toUpperCase()} SHIPS. OLDER FRONTIER MODELS NOW SELL FOR ${Math.round(AGE_PRICE * 100)}% OF WHAT THEY DID.`, "bad");
+  scheduleGen(state, false);
+}
+function worldTick(state, dt) {
+  const w = state.world;
+  if (!w) return;
+  if (ruleOn(state, "gens")) {
+    if (!w.next && siteAtLeast(state, "datacenter")) scheduleGen(state, false);
+    if (w.next && !w.next.told && state.day >= w.next.lands - ANNOUNCE_DAYS) announceGen(state);
+    if (w.next && state.day >= w.next.lands) landGen(state);
+  }
+  if (ruleOn(state, "market") && w.W) {
+    const grow = 1 / (500 + state.day);
+    for (const tier of Object.keys(TIERS)) {
+      const f = state.marketF?.[tier] ?? 1;
+      const rate = grow + BUILD_RATE * Math.max(0, f - 1) - LEAVE_RATE * Math.max(0, 1 - f);
+      w.W[tier] = Math.max(WORLD_FLOOR * worldDemand(state, tier), w.W[tier] * Math.exp(rate * dt));
+    }
+  }
+  for (const o of w.orders.filter((x) => x.ready <= state.day)) deliver(state, o);
+}
+/** The weaker half of what's serving, by earnings per kilowatt: what a new model costs least to train on. */
+export function weakerHalf(state) {
+  const kw = (u) => (u.sku ? skuOf(u).kW * u.racks : dcLoad(u) / 1000) || 1;
+  const units = allUnits(state).filter((u) => u.task === "serve" && (u.sku ? u.on : isRunning(u)) && u.output?.mtok);
+  units.sort((a, b) => (a.output.revenue || 0) / kw(a) - (b.output.revenue || 0) / kw(b));
+  return units.slice(0, Math.ceil(units.length / 2));
+}
+/** Days a training run would take on these units at today's speed. */
+export function trainingDays(state, kind, units) {
+  const spec = trainingSpec(state, kind);
+  const power = units.reduce((n, u) => n + (u.sku ? skuOf(u).cards * skuOf(u).bandwidth * u.racks * (state.capFactor ?? 1) : u.gpus.reduce((k, g) => k + part("gpus", g.id).bandwidth, 0)), 0);
+  const speed = power * thermalThrottle(state.roomC) * (1 + researchBonus(state, "training"));
+  return speed ? spec.work / speed : Infinity;
+}
+/** Your newest frontier model, and how far behind the frontier it is. */
+export function ownFrontier(state) {
+  const mine = allModels(state).filter((m) => m.own && m.tier === "frontier");
+  return mine.sort((a, b) => (b.gen || 0) - (a.gen || 0) || b.premium - a.premium)[0] || null;
+}
+/** Switch one rule. Turning one off puts its part of the game back the way it was. */
+export function setRule(state, id, on) {
+  const w = state.world;
+  state.rules = { ...state.rules, [id]: !!on };
+  if (id === "gens") {
+    if (on && !w.next && siteAtLeast(state, "datacenter")) scheduleGen(state, true);
+    if (!on) {
+      // The clock stops. Racks ordered for a generation that now won't come are refunded.
+      const unreleased = w.orders.filter((o) => genSku(o.sku).gen > w.gen);
+      for (const o of unreleased) state.cash += o.paid;
+      w.orders = w.orders.filter((o) => !unreleased.includes(o));
+      w.next = null;
+    }
+  }
+  if (id === "market" && on) initMarket(state);
+  if (id === "supply" && !on) for (const o of w.orders.filter((x) => genSku(x.sku).gen <= w.gen)) deliver(state, o);
+  recompute(state);
+  say(state, `${by(RULES, id).name.toUpperCase()}: ${on ? "ON" : "OFF"}.`, "info");
+  return { ok: true };
+}
+
 // ---- The fleet: racks bought and run by the row ----
 export const RACKS_PER_ROW = 8;
-export const rackPrice = (state, sku) => Math.round(sku.price * state.index.gpus);
-export const skuAvailable = (state, sku) => siteAtLeast(state, sku.site);
+/** Each generation behind the newest knocks 28% off what a rack costs and what it sells for. It stays knocked off if the rule is switched off, so switching can't mint money. */
+const genDiscount = (state, sku) => Math.pow(0.72, Math.max(0, (state.world?.gen || 0) - (sku.gen || 0)));
+export const rackPrice = (state, sku) => Math.round(sku.price * state.index.gpus * genDiscount(state, sku));
+export const skuAvailable = (state, sku) => siteAtLeast(state, sku.site) && (sku.gen || 0) <= (state.world?.gen || 0);
+/** Every rack on sale: the catalog, then one more for each generation that has landed. */
+export const fleetRacks = (state) => [...CATALOG.fleetRacks, ...Array.from({ length: state.world?.gen || 0 }, (_, i) => genSku(i + 1))];
+/** What the status page may suggest buying outright: on sale here, and not waiting on an allocation. */
+const instantRacks = (state, s = state) => fleetRacks(state).filter((x) => skuAvailable(s, x) && !isAllocated(state, x));
 
 /** What it takes to run n more racks: extra halls, cooling and switches, chosen the cheap way. Power is never included; it takes time. */
 export function provisionPlan(state, sku, n) {
@@ -2026,10 +2354,17 @@ export function provisionPlan(state, sku, n) {
 /** Buy n racks with whatever floor, cooling and network they need. Partial rows of the same rack fill up first. */
 export function buyRacks(state, skuId, n = 1, chosenPlan = null) {
   const sku = part("fleetRacks", skuId);
+  if (!sku) return { ok: false, reason: "That rack isn't for sale." };
+  if (isAllocated(state, sku)) return orderRacks(state, skuId, n);
   if (!skuAvailable(state, sku)) return { ok: false, reason: `${sku.name} needs a ${by(SITES, sku.site).name.toLowerCase()}. It's too much for this site.` };
+  return installRacks(state, sku, n, chosenPlan, rackPrice(state, sku) * n);
+}
+/** Put n racks on the floor, paying `rackCost` for them plus whatever floor, cooling and switches they need. */
+function installRacks(state, sku, n, chosenPlan, rackCost) {
+  const skuId = sku.id;
   const plan = chosenPlan || provisionPlan(state, sku, n);
   if (plan.problem) return { ok: false, reason: plan.problem };
-  const cost = rackPrice(state, sku) * n + plan.cost - plan.refund;
+  const cost = rackCost + plan.cost - plan.refund;
   if (state.cash < cost) return { ok: false, reason: `You need $${Math.ceil(cost - state.cash).toLocaleString("en-US")} more.` };
   state.cash -= cost + plan.refund;
   for (const id of plan.retire) sellMachine(state, id);
@@ -2378,7 +2713,7 @@ export function startProject(state, kind, machineIds) {
   const spec = trainingSpec(state, kind);
   const machines = allUnits(state).filter((m) => machineIds.includes(m.id) && isRunning(m));
   if (!machines.some((m) => totalVram(m) >= spec.minVram)) return { ok: false, reason: `One running machine needs ${spec.minVram} GB of GPU memory to start.` };
-  state.project = { kind, work: 0, need: spec.work };
+  state.project = { kind, work: 0, need: spec.work, gen: spec.gen, sizeGB: spec.sizeGB };
   for (const m of machines) m.task = kind;
   say(state, `${spec.name}: started. Those machines stop earning until it's done.`, "good");
   recompute(state);
@@ -2392,9 +2727,11 @@ export function cancelProject(state) {
 export function finishModel(state, name) {
   const p = state.pendingName;
   if (!p) return;
-  const spec = trainingSpec(state, p.kind);
+  const spec = trainingSpec(state, p.kind, p.gen);
   const clean = String(name).trim().slice(0, 28) || "Untitled";
-  state.ownModels.push({ id: `own-${state.nextId++}`, name: clean, maker: "You", tier: spec.tier, params: spec.sizeGB * 2, active: null, moe: false, sizes: { Q4: spec.sizeGB }, goodAt: "whatever you trained it to do", premium: spec.premium, kind: p.kind, own: true });
+  // The model is what the run was started for: its size and generation, whatever has changed since.
+  const size = p.sizeGB ?? spec.sizeGB;
+  state.ownModels.push({ id: `own-${state.nextId++}`, name: clean, maker: "You", tier: spec.tier, params: size * 2, active: null, moe: false, sizes: { Q4: size }, goodAt: "whatever you trained it to do", premium: spec.premium, kind: p.kind, own: true, gen: p.gen ?? (state.world?.gen || 0) });
   say(state, `${clean.toUpperCase()} IS LIVE. YOU MADE YOUR OWN AI.`, "good");
   state.pendingName = null;
   recompute(state);
@@ -2510,6 +2847,7 @@ function tickStep(state, dt) {
   growApps(state, dt);
   researchOf(state).points += pointsPerDay(state) * dt;
   state.day += dt;
+  worldTick(state, dt);
   const yearly = 0.97;
   for (const t of Object.keys(state.deflation)) state.deflation[t] = Math.max(0.55, state.deflation[t] * Math.pow(yearly, dt / 365));
   for (const k of Object.keys(state.index)) state.index[k] += (1 - state.index[k]) * 0.002 * dt;
@@ -2553,8 +2891,11 @@ function tickStep(state, dt) {
     state.contract.done += credit;
     // The last delivery can run past what was asked. The extra sells at market price, not the deal's.
     if (made > credit) {
-      const unit = allUnits(state).find((u) => u.output?.model?.tier === state.contract.tier);
-      if (unit) state.cash -= (made - credit) * (unit.output.rate || 0) * (state.contract.rate - 1);
+      // Priced at the average rate of what that size sold, so the order of machines can't change it.
+      const units = allUnits(state).filter((u) => u.output?.model?.tier === state.contract.tier && u.output.mtok);
+      const volume = units.reduce((n, u) => n + u.output.mtok * (u.output.util ?? 1), 0);
+      const avg = volume ? units.reduce((n, u) => n + u.output.mtok * (u.output.util ?? 1) * (u.output.rate || 0), 0) / volume : 0;
+      state.cash -= (made - credit) * avg * (state.contract.rate - 1);
     }
     if (state.contract.done >= state.contract.mtok) {
       say(state, `${state.contract.client.toUpperCase()} DEAL DELIVERED. REPUTATION UP.`, "good");
@@ -2575,7 +2916,7 @@ function tickStep(state, dt) {
       + state.rows.filter((r) => r.task !== "serve" && r.on).reduce((n, r) => n + skuOf(r).cards * skuOf(r).bandwidth * r.racks, 0) * (state.capFactor ?? 1);
     state.project.work += power * thermalThrottle(state.roomC) * (1 + researchBonus(state, "training")) * dt;
     if (state.project.work >= state.project.need) {
-      state.pendingName = { kind: state.project.kind };
+      state.pendingName = { kind: state.project.kind, gen: state.project.gen, sizeGB: state.project.sizeGB };
       for (const m of allUnits(state)) m.task = "serve";
       state.project = null;
     }
