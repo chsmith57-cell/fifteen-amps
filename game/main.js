@@ -868,7 +868,7 @@ function Models({ m }) {
 /** Why your machines earn different amounts, and one button to bring the weaker ones up to your best. */
 function MatchBest() {
   if (state.machines.length < 2) return null;
-  const plan = remembered("matchbest", () => G.matchPlan(state));
+  const plan = advice.ok ? adviceFor("match") : remembered("matchbest", () => G.matchPlan(state));
   if (!plan || !plan.waiting) return null;
   const go = () => { const r = G.matchBest(state); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} of ${r.of} ${r.of === 1 ? "machine" : "machines"} up to ${plan.best.name}'s spec.`); doIt(r); };
   const short = plan.count && state.cash < plan.cost;
@@ -885,26 +885,53 @@ const holdsWhole = (m, models) => models.some((x) => Object.keys(x.sizes).some((
 function TierBuild({ m, tier, models, perCard }) {
   if (m.sku || tier === "tiny" || holdsWhole(m, models)) return null;
   const need = G.cardNeed(state, tier);
-  const plan = remembered(`tierbuild|${tier}`, () => G.tierBuild(state, tier));
+  const plan = advice.ok ? adviceFor("tier")?.[tier] : remembered(`tierbuild|${tier}`, () => G.tierBuild(state, tier));
+  if (!plan) return null;
   const name = G.TIERS[tier].name.toLowerCase();
-  const build = () => { const r = G.buildForTier(state, tier, plan.cost); freshMoves(); if (r.stale) slowKey = ""; if (r.ok) { ui.machineId = r.id; flashNote(`Built ${r.plan.n} x ${G.shortName(r.plan.card)} running ${r.plan.model.name}.`); } doIt(r); };
+  const build = () => { const r = G.buildForTier(state, tier, plan.cost); freshMoves(); if (r.ok) { ui.machineId = r.id; flashNote(`Built ${r.plan.n} x ${G.shortName(r.plan.card)} running ${r.plan.model.name}.`); } doIt(r); };
   return html`<div class="tierbuild">
     <p class="small d1">${G.TIERS[tier].name} models need about ${need.rough} GB on one card at rough quality, ${need.standard} GB at standard. ${perCard ? `This machine's biggest card has ${perCard} GB, so here they'd be split across cards, where only one works at a time and the slowest sets the pace.` : ""}</p>
     ${plan.problem ? html`<p class="small d2">${plan.problem}</p>` : html`<button class="act lead" disabled=${state.cash < plan.cost} onClick=${build}>build the machine that pays back fastest on ${name} models: ${plan.n} x ${G.shortName(plan.card)}, ${money(plan.cost)}, about +${money(plan.perDay)} a day, back in ${Math.ceil(plan.payback)} days</button>${state.cash < plan.cost ? html`<span class="small d2"> ${money(plan.cost - state.cash)} short</span>` : null}`}
   </div>`;
 }
-// fitPath and quotes try things on copies of the game, so keep the answer until the setup changes.
+// Quotes try things on copies of the game. Keep each answer until the company changes, or a few seconds pass, and when one goes
+// stale, show the old answer and work out a fresh one between frames, one at a time, so the screen never freezes for them.
 const slowCache = new Map();
+const slowQueue = new Map();
 let slowKey = "";
-function remembered(key, compute) {
+let slowPump = false;
+function slowSetup() {
   // Prices drift a little every tick, so round them; a loaded model, a hire or a deal changes the answers too.
-  const setup = JSON.stringify([Math.floor(state.day / 5), state.site, state.tech, G.totalRacks(state), Math.round(state.index.gpus * 50), Math.round(state.index.memory * 50), state.racks, state.team, state.research?.levels, state.contract?.tier, state.rules, state.world?.gen, state.curtail?.until, state.salesRef && Math.round(Math.log(state.salesRef) * 20), state.rows.map((r) => [r.id, r.racks, r.on, r.tuned, r.modelId]), state.machines.map((x) => [x.id, x.chassis, x.board, x.gpus.map((g) => g.id), x.psus, x.memory, x.modelId, x.quant, x.on, x.task])]);
-  if (setup !== slowKey) {
-    slowKey = setup;
-    slowCache.clear();
+  return JSON.stringify([state.site, state.tech, G.totalRacks(state), Math.round(state.index.gpus * 50), Math.round(state.index.memory * 50), state.racks, state.team, state.research?.levels, state.contract?.tier, state.rules, state.world?.gen, state.curtail?.until, state.rows.map((r) => [r.id, r.racks, r.on, r.tuned, r.modelId]), state.machines.map((x) => [x.id, x.chassis, x.board, x.gpus.map((g) => g.id), x.psus, x.memory, x.modelId, x.quant, x.on, x.task])]);
+}
+function pumpSlow() {
+  if (slowPump) return;
+  slowPump = true;
+  setTimeout(() => {
+    slowPump = false;
+    const next = slowQueue.entries().next().value;
+    if (!next || !state) return;
+    const [key, compute] = next;
+    slowQueue.delete(key);
+    slowCache.set(key, { value: compute(), setup: slowKey, at: performance.now() });
+    draw();
+    if (slowQueue.size) pumpSlow();
+  }, 30);
+}
+function remembered(key, compute, ttl = 5000) {
+  const setup = slowSetup();
+  if (setup !== slowKey) slowKey = setup;
+  const hit = slowCache.get(key);
+  if (!hit) {
+    const value = compute();
+    slowCache.set(key, { value, setup, at: performance.now() });
+    return value;
   }
-  if (!slowCache.has(key)) slowCache.set(key, compute());
-  return slowCache.get(key);
+  if (hit.setup !== setup || performance.now() - hit.at > ttl) {
+    slowQueue.set(key, compute);
+    pumpSlow();
+  }
+  return hit.value;
 }
 const HOW = { single: () => "fits on one card", copies: (f) => `${f.copies} copies, one per card`, split: (f) => `split across ${f.copies === 1 ? "cards" : "cards"}, no extra speed`, spill: () => "spills into RAM, slow" };
 function ModelRow({ m, model, best, bestQuant, noPath = false }) {
@@ -979,13 +1006,13 @@ function More({ id, title, open = false, children }) {
 }
 /** A deal's numbers, kept until the setup changes. */
 function dealQuote(deal, offer) {
-  const key = `deal|${deal.client}|${deal.mtok}|${Math.floor(deal.done || 0)}|${state.site}|${state.cooling.length}|${state.feed}|${G.allUnits(state).map((u) => `${u.id}${u.modelId}${u.quant}${u.on}${u.task}${u.racks || ""}${u.gpus?.length || ""}${u.forDeal ? 1 : 0}`).join()}`;
-  return remembered(key, () => {
-    const q = offer ? G.dealGain(state) : G.dealForecast(state);
-    const v = G.dealView(state, deal, q.made);
-    const enough = v.enough && !q.trips;
-    return { gain: q.gain || 0, view: { ...v, enough }, trips: q.trips, plan: enough ? null : G.dealPlan(state, deal) };
-  });
+  // The slow part, what taking it earns and what to give it, comes from the advice worker; progress is worked out here, live.
+  const slot = offer ? "offer" : "contract";
+  const fits = (d) => (d && d.client === deal.client && d.mtok === deal.mtok ? d : null);
+  const q = advice.ok ? fits(adviceFor("deals")?.[slot]) : remembered(`deal|${slot}|${deal.client}|${deal.mtok}`, () => G.dealAdvice(state, deal, offer));
+  const v = G.dealView(state, deal, q?.made ?? null);
+  const enough = v.enough && !q?.trips;
+  return { gain: q?.gain || 0, view: { ...v, enough }, trips: q?.trips, plan: enough ? null : q?.plan || null, pending: !q };
 }
 const sign = (n) => `${n < 0 ? "-" : "+"}${moneyAny(Math.abs(n))}`;
 const names = (list, most = 3) => `${list.slice(0, most).join(", ")}${list.length > most ? `, and ${list.length - most} more` : ""}`;
@@ -1712,9 +1739,9 @@ function Lab({ m }) {
         return G.TEAM.map((x) => {
           const n = G.teamCount(state, x.id);
           const cost = G.teamHireCost(state, x.id);
-          const q = remembered(`team|${x.id}`, () => G.teamQuote(state, x.id));
+          const q = (advice.ok ? adviceFor("team")?.[x.id] : remembered(`team|${x.id}`, () => G.teamQuote(state, x.id))) || { gain: 0, pending: true };
           return html`<div class="staff" key=${x.id}>
-            <span><span class="name">${x.name}${n ? `, ${n}` : ""}</span>${n ? html`<span class="d1">, +${Math.round(G.teamBonus(state, x.id) * 100)}% ${x.id === "inference" ? "tokens" : "buyers"} so far</span>` : null}<br /><span class="small d1">${x.text} The next one adds about ${(G.teamNextShare(state, x.id) * 100).toFixed(1)}% for ${money(G.teamNextSalary(state, x.id))} a day.</span><br /><span class=${`small ${q.gain > 0.5 ? "sig" : "d2"}`}>${q.gain > 0.5 ? `Today: +${moneyShort(q.gain)} a day after pay, back in ${Math.ceil(cost / q.gain).toLocaleString("en-US")} days.` : `Today: ${q.gain < -0.5 ? `${moneyShort(-q.gain)} a day worse` : "no better off"} after pay. ${reason[x.id]}`}</span></span>
+            <span><span class="name">${x.name}${n ? `, ${n}` : ""}</span>${n ? html`<span class="d1">, +${Math.round(G.teamBonus(state, x.id) * 100)}% ${x.id === "inference" ? "tokens" : "buyers"} so far</span>` : null}<br /><span class="small d1">${x.text} The next one adds about ${(G.teamNextShare(state, x.id) * 100).toFixed(1)}% for ${money(G.teamNextSalary(state, x.id))} a day.</span><br /><span class=${`small ${q.gain > 0.5 ? "sig" : "d2"}`}>${q.pending ? "Working out what one more would add." : q.gain > 0.5 ? `Today: +${moneyShort(q.gain)} a day after pay, back in ${Math.ceil(cost / q.gain).toLocaleString("en-US")} days.` : `Today: ${q.gain < -0.5 ? `${moneyShort(-q.gain)} a day worse` : "no better off"} after pay. ${reason[x.id]}`}</span></span>
             <span class="staffbtn"><button class="act lead" disabled=${state.cash < cost} onClick=${() => { freshMoves(); doIt(G.hireTeam(state, x.id)); }}>hire, ${moneyShort(cost)}</button>${n ? html`<button class="act small" onClick=${() => { freshMoves(); doIt(G.letGoTeam(state, x.id), false); }}>let one go</button>` : null}</span>
           </div>`;
         });
@@ -1799,7 +1826,57 @@ function Lab({ m }) {
 // the screen draws the last answer and a fresh one lands just after, at most a few percent of the time.
 let moveCache = { key: "", moves: [], at: 0, cost: 0, pending: false, machineId: null };
 function movesKey(m) {
-  return JSON.stringify([m.id, state.site, state.feed, state.feedOrder, state.halls, state.tech, state.techOff, state.research?.levels, state.cooling, state.network, state.racks, state.machines.map((x) => [x.chassis, x.board, x.cpu, x.cooler, x.storage, x.psus, x.memory, x.gpus.map((g) => g.id), x.modelId, x.quant, x.on, x.tuned, x.task]), state.rows.map((r) => [r.sku, r.racks, r.modelId, r.quant, r.on, r.tuned, r.task])]);
+  return JSON.stringify([m.id, state.offer?.client, state.offer?.mtok, state.contract?.client, state.site, state.feed, state.feedOrder, state.halls, state.tech, state.techOff, state.research?.levels, state.team, state.cooling, state.network, state.racks, state.machines.map((x) => [x.chassis, x.board, x.cpu, x.cooler, x.storage, x.psus, x.memory, x.gpus.map((g) => g.id), x.modelId, x.quant, x.on, x.tuned, x.task]), state.rows.map((r) => [r.sku, r.racks, r.modelId, r.quant, r.on, r.tuned, r.task])]);
+}
+// The advice runs in a worker, off the page's thread: the page sends a copy of the game when the company changes, or every few
+// seconds for prices, and keeps drawing with the last answer until the next one lands. If a browser can't start one, the old
+// way below takes over.
+const advice = { worker: null, ok: false, seq: 0, pending: false, key: "", at: 0, data: null };
+function startAdvisor() {
+  if (advice.worker || typeof Worker === "undefined") return;
+  try {
+    advice.worker = new Worker(new URL("./advisor.js", import.meta.url), { type: "module" });
+    advice.ok = true;
+    advice.worker.onmessage = (e) => {
+      if (e.data.seq !== advice.seq) return;
+      advice.pending = false;
+      if (e.data.error) { console.warn("advisor:", e.data.error); return; }
+      advice.data = e.data;
+      advice.at = performance.now();
+      draw();
+    };
+    advice.worker.onerror = (e) => { console.warn("advisor stopped:", e.message); advice.ok = false; advice.pending = false; };
+  } catch {
+    advice.ok = false;
+  }
+}
+function askAdvice(m) {
+  if (!advice.ok) return false;
+  // A worker that never answers is as good as none: after 15 seconds, work it out on the page as before.
+  if (advice.pending && performance.now() - advice.sent > 15000) {
+    console.warn("advisor never answered; working it out on the page");
+    advice.ok = false;
+    advice.pending = false;
+    return false;
+  }
+  const key = movesKey(m);
+  if (advice.pending || (key === advice.key && performance.now() - advice.at < 3000)) return true;
+  advice.pending = true;
+  advice.sent = performance.now();
+  advice.key = key;
+  advice.seq++;
+  try {
+    advice.worker.postMessage({ seq: advice.seq, state, machineId: m.id });
+  } catch {
+    advice.ok = false;
+    advice.pending = false;
+    return false;
+  }
+  return true;
+}
+/** What the worker said, or null while it's still thinking or isn't running. */
+function adviceFor(part) {
+  return advice.ok && advice.data ? advice.data[part] ?? null : null;
 }
 function computeMoves(m, key) {
   const t0 = performance.now();
@@ -1812,6 +1889,7 @@ function computeMoves(m, key) {
   moveCache.day = state.day;
 }
 function rankedMoves(m) {
+  if (askAdvice(m)) return advice.data?.moves || [];
   const key = movesKey(m);
   const sameCompany = key === moveCache.key;
   if (!moveCache.at || (!sameCompany && moveCache.machineId !== m.id)) {
@@ -1826,9 +1904,14 @@ function rankedMoves(m) {
   }
   return moveCache.moves;
 }
+/** After a click, drop the old advice so a move just done can't be offered again, and ask for new advice now. */
 function freshMoves() {
   moveCache.at = 0;
   moveCache.key = "";
+  advice.key = "";
+  advice.at = 0;
+  if (advice.data) advice.data = { ...advice.data, moves: [] };
+  slowCache.clear();
 }
 const GAUGE_TARGET = { network: "room", power: "room", heat: "room", noise: "room", space: "room", bill: "room", buyers: "market", rep: "market", speed: "models", memory: "models" };
 function Gauge({ r }) {
@@ -1985,7 +2068,7 @@ function Status2({ m }) {
         ${shown ? html`
           ${paid.map(moveItem)}
           ${extra.length ? html`<${More} id="moremoves" title=${`Other options: ${extra.length}`}>${extra.map(moveItem)}</${More}>` : null}
-          ${paid.length ? null : html`<p class="d2" style="margin:0">Nothing you can add right now would earn more than its power costs. Compare what you make with what buyers want, or look at swapping machines for a bigger model.</p>`}
+          ${paid.length ? null : advice.ok && advice.pending ? html`<p class="d2" style="margin:0">Working out your moves.</p>` : html`<p class="d2" style="margin:0">Nothing you can add right now would earn more than its power costs. Compare what you make with what buyers want, or look at swapping machines for a bigger model.</p>`}
         ` : html`<p class="d2" style="margin:0">Hidden. The numbers above are all you need.</p>`}
       </section>
     </div>
@@ -2331,6 +2414,7 @@ addEventListener("keydown", (e) => {
 addEventListener("visibilitychange", () => { if (document.hidden) writeSave(); });
 
 function boot(snapshot) {
+  startAdvisor();
   if (snapshot?.state) {
     state = snapshot.state;
     Object.assign(ui, snapshot.ui || {});
@@ -2349,4 +2433,4 @@ window.claude?.hot?.snapshot?.(() => ({ state, ui: { screen: ui.screen, layer: u
   else boot(window.claude?.hot?.data ?? {});
 });
 // For the headless tests. Harmless in play.
-window.__game = { get state() { return state; }, ui, draw, G };
+window.__game = { get state() { return state; }, ui, draw, G, advice };

@@ -1191,6 +1191,10 @@ export function buildForTier(state, tier, quoted = null) {
   if (plan.problem) return { ok: false, reason: plan.problem };
   if (quoted != null && Math.abs(plan.cost - quoted) > 1) return { ok: false, reason: `That build now costs $${Math.round(plan.cost).toLocaleString("en-US")}. Nothing was bought; the new price is showing.`, stale: true };
   if (state.cash < plan.cost) return { ok: false, reason: `You need $${Math.ceil(plan.cost - state.cash).toLocaleString("en-US")} more.` };
+  return buildPlan(state, plan);
+}
+/** Build a plan tierBuild already made, without planning again. */
+function buildPlan(state, plan) {
   const keep = snapshotParts(state);
   const m = makeTierMachine(state, plan.card.id, plan.n, plan.rack);
   if (!m) {
@@ -1320,9 +1324,20 @@ export function nextMoves(state, machineId) {
     sharedOptions = null;
   }
 }
-function rankMoves(state, machineId) {
+/** One move, freshly priced, without pricing all the others: what a click needs. */
+export function moveById(state, id, machineId) {
+  sharedOptions = new Map();
+  try {
+    return rankMoves(state, machineId ?? state.machines[0]?.id, id).find((x) => x.id === id) || null;
+  } finally {
+    sharedOptions = null;
+  }
+}
+/** `only` prices just the move with that id, for a click. */
+function rankMoves(state, machineId, only = null) {
   const baseline = rehearse(state, () => {});
-  const current = settledProfit(state);
+  // Only "load the best model" is measured against today's settled profit, so skip that pass when pricing anything else.
+  const current = !only || only === "optimize" ? settledProfit(state) : 0;
   const moves = [{ id: "optimize", free: true, label: `Load the best model on every ${state.rows.length ? "rack and machine" : "machine"}`, run: () => {} }];
   for (const t of TECH) if (!hasTech(state, t.id) && techAvailable(state, t)) moves.push({ id: `tech-${t.id}`, label: t.name, run: (s) => buyTech(s, t.id) });
   for (const t of TECH) if (t.demand && hasTech(state, t.id) && !techActive(state, t.id) && techAvailable(state, t)) moves.push({ id: `restart-${t.id}`, free: true, label: `Restart ${t.name.toLowerCase()}`, run: (s) => toggleTech(s, t.id) });
@@ -1385,10 +1400,11 @@ function rankMoves(state, machineId) {
   if (!fleetDominant) {
     for (const tier of ["small", "medium", "large", "frontier"]) {
       const v = state.stats.soldByTier?.[tier];
+      if (only && only !== `tierbuild-${tier}`) continue;
       if ((v?.supply || 0) > tierDemand(state, tier) * 0.5) continue;
       const plan = tierBuild(state, tier);
       if (plan.problem) continue;
-      moves.push({ id: `tierbuild-${tier}`, label: `Build a machine for ${TIERS[tier].name.toLowerCase()} models: ${plan.n} x ${shortName(plan.card)}`, unlocks: `Buyers want more ${TIERS[tier].name.toLowerCase()} than you make. It runs ${plan.model.name}${plan.whole ? ", whole on each card, so every card works" : ""}.`, run: (s) => buildForTier(s, tier) });
+      moves.push({ id: `tierbuild-${tier}`, label: `Build a machine for ${TIERS[tier].name.toLowerCase()} models: ${plan.n} x ${shortName(plan.card)}`, unlocks: `Buyers want more ${TIERS[tier].name.toLowerCase()} than you make. It runs ${plan.model.name}${plan.whole ? ", whole on each card, so every card works" : ""}.`, run: (s) => buildForTier(s, tier), forecast: (s) => buildPlan(s, plan) });
     }
   }
   // A fresh workstation, for when every case is full of small cards.
@@ -1471,6 +1487,7 @@ function rankMoves(state, machineId) {
   const out = [];
   const floorGain = fleetDominant ? Math.abs(state.stats.profitPerDay) * 0.002 : 0;
   for (const move of moves) {
+    if (only && move.id !== only) continue;
     const r = rehearse(state, move.forecast || move.run, move.valid);
     if (!r) continue;
     const free = !!move.free;
@@ -1482,6 +1499,7 @@ function rankMoves(state, machineId) {
   // More power and bigger sites pay off only once something is plugged in, so price them with the best racks that would fill them.
   // A move does exactly what it priced: whatever racks it counted on get bought by the same click.
   const bundled = (id, label, unlockRun, fills, what, extras = [], fixedCount = null, realRun = unlockRun) => {
+    if (only && id !== only) return;
     const costOnly = rehearse(state, unlockRun);
     if (!costOnly) return;
     // Counted in what you could buy today after the unlock, so the bundle doesn't run away from you as you save.
@@ -1582,6 +1600,7 @@ function rankMoves(state, machineId) {
   const tried = {};
   for (const o of [...out].sort((a, b) => a.payback - b.payback)) {
     if (!o.group || o.group.length < 2) continue;
+    if (only && o.id !== only) continue;
     tried[o.kind] = (tried[o.kind] || 0) + 1;
     if (tried[o.kind] > 2) continue;
     const r = rehearse(state, (c) => {
@@ -1596,7 +1615,7 @@ function rankMoves(state, machineId) {
     const gain = r.profit - baseline.profit;
     o.all = { count: o.group.length, cost: r.cost, gain, payback: gain > 0.01 ? Math.max(0, r.cost) / gain : Infinity, trips: r.amps >= r.limit };
   }
-  const kept = fleetDominant ? out.filter((o) => !o.group?.length || (o.all && o.all.gain >= floorGain)) : out;
+  const kept = fleetDominant && !only ? out.filter((o) => !o.group?.length || (o.all && o.all.gain >= floorGain)) : out;
   const rank = (o) => (fleetDominant && o.all ? o.all.payback : o.payback);
   return kept.sort((a, b) => rank(a) - rank(b) || a.cost - b.cost);
 }
@@ -1664,7 +1683,7 @@ function settledProfit(state) {
 }
 /** Do a ranked move for real. */
 export function doMove(state, move, machineId) {
-  const fresh = nextMoves(state, machineId ?? state.machines[0]?.id).find((x) => x.id === move.id);
+  const fresh = moveById(state, move.id, machineId);
   if (!fresh) return { ok: false, reason: "That move isn't available any more." };
   if (fresh.trips) return { ok: false, reason: `That would trip the breaker at ${fresh.amps.toFixed(1)} A.` };
   // Prices move while you look. If this costs more than what was shown, buy nothing and show the new price.
@@ -1690,7 +1709,7 @@ function rehome(state, m, chassisId) {
 }
 /** Do a move on every machine like this one, or as many as the cash covers. */
 export function doMoveAll(state, move, machineId) {
-  const fresh = nextMoves(state, machineId ?? state.machines[0]?.id).find((x) => x.id === move.id);
+  const fresh = moveById(state, move.id, machineId);
   if (!fresh?.all) return { ok: false, reason: "That move isn't available any more." };
   let done = 0;
   const cards = (st, id) => st.machines.find((x) => x.id === id)?.gpus.map((g) => g.id).join();
@@ -2898,6 +2917,13 @@ function settle(state) {
   }
 }
 /** What this deal's size will really make once the room settles, and whether the breaker holds. */
+/** The slow part of a deal's quote, for the advice worker: what taking it earns, what you'd make for it, and the machines to give it if that's short. */
+export function dealAdvice(state, deal, offer) {
+  const q = offer ? dealGain(state) : dealForecast(state);
+  const v = dealView(state, deal, q.made);
+  const enough = v.enough && !q.trips;
+  return { client: deal.client, mtok: deal.mtok, gain: q.gain || 0, made: q.made, trips: !!q.trips, plan: enough ? null : dealPlan(state, deal) };
+}
 export function dealForecast(state) {
   const copy = JSON.parse(JSON.stringify(state));
   copy.spike = null;
