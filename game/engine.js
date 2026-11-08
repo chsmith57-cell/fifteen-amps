@@ -1114,7 +1114,7 @@ function addGpu(state, machineId, id) {
   return buy(state, "gpus", id, machineId);
 }
 
-const shortName = (g) => g.name.replace(/^(GeForce|NVIDIA|Intel|Radeon RX) /, "").replace(/ Blackwell( Workstation)?( Edition)?/, "").replace(/ - .*$/, "").replace(/ \(.*$/, "");
+export const shortName = (g) => g.name.replace(/^(GeForce|NVIDIA|Intel|Radeon RX) /, "").replace(/ Blackwell( Workstation)?( Edition)?/, "").replace(/ - .*$/, "").replace(/ \(.*$/, "");
 
 const WORKSTATION = (state, rack) => [["chassis", rack ? "silverstone-rm44" : "phanteks-enthoo-pro-2-server"], ["boards", "asrock-wrx90-ws-evo"], ["cpus", "amd-threadripper-pro-9965wx"], ["coolers", "noctua-nh-u14s-tr5-sp6"], ["psus", site(state).volts >= 200 ? "silverstone-hela-2050r" : "corsair-hx1500i"], ["storage", "samsung-990-pro-2tb"], ["memory", "samsung-m321r8ga0bb0-cqk-64gb-4800"]];
 /** Buy every part this draft is still missing for a four-card workstation. */
@@ -1136,6 +1136,61 @@ export function buildWorkstation(state, cardId, rack = false) {
   const m = addMachine(state);
   fillWorkstation(state, m, cardId, rack);
   return { ok: true, id: m.id };
+}
+
+/** The smallest memory one card needs to hold any model of this size whole, at rough quality and at standard. */
+export function cardNeed(state, tier) {
+  const inTier = allModels(state).filter((x) => x.tier === tier);
+  const toGB = (size) => Math.ceil((size + 1.5) / 1.0737);
+  return { rough: toGB(Math.min(...inTier.map((x) => Math.min(...Object.values(x.sizes))))), standard: toGB(Math.min(...inTier.map((x) => x.sizes.Q4 ?? Infinity))) };
+}
+/** The best new machine for one size of model: a standard workstation with 1, 2 or 4 of one card, whichever pays back fastest
+ *  on that size, after power, without tripping anything. Tried on copies, so nothing is bought. */
+export function tierBuild(state, tier) {
+  const rack = floorUsed(state) + 1 > floorLimit(state);
+  if (rack && rackUnits(state) - rackUsed(state) < 4) return { problem: "No free floor spot or rack space. Buy a rack on the floor's racks tab, or sell a machine." };
+  let best = null;
+  for (const g of CATALOG.gpus) {
+    for (const n of [1, 2, 4]) {
+      const copy = rehearsalCopy(state);
+      copy.cash = 1e12;
+      recompute(copy);
+      const r = buildWorkstation(copy, g.id, rack);
+      const m = copy.machines.find((x) => x.id === r.id);
+      for (let i = 1; i < n; i++) buy(copy, "gpus", g.id, m.id);
+      if (m.gpus.length !== n || !isComplete(m)) continue;
+      const cost = 1e12 - copy.cash;
+      let pick = null;
+      for (const model of allModels(copy).filter((x) => x.tier === tier)) {
+        for (const quant of Object.keys(model.sizes)) {
+          const e = estimateEarn(copy, m, model, quant);
+          if (!e.fit.fits || e.fit.mode === "spill") continue;
+          if (!pick || e.perDay > pick.perDay) pick = { model, quant, perDay: e.perDay };
+        }
+      }
+      if (!pick) continue;
+      loadModel(copy, m.id, pick.model.id, pick.quant);
+      recompute(copy);
+      if (copy.amps >= safeAmps(copy) * 0.97) continue;
+      const net = pick.perDay - dollarsPerDay(copy, m.output.wall || dcLoad(m) / 0.92);
+      if (net <= 0) continue;
+      const payback = cost / net;
+      if (!best || payback < best.payback) best = { card: g, n, cost, perDay: net, payback, model: pick.model, quant: pick.quant, rack, whole: m.output.fit?.mode === "single" || m.output.fit?.mode === "copies" };
+    }
+  }
+  return best || { problem: "Nothing you can build here makes money on this size yet." };
+}
+/** Build what tierBuild found, for real, and load its model. */
+export function buildForTier(state, tier) {
+  const plan = tierBuild(state, tier);
+  if (plan.problem) return { ok: false, reason: plan.problem };
+  if (state.cash < plan.cost) return { ok: false, reason: `You need $${Math.ceil(plan.cost - state.cash).toLocaleString("en-US")} more.` };
+  const r = buildWorkstation(state, plan.card.id, plan.rack);
+  const m = state.machines.find((x) => x.id === r.id);
+  for (let i = 1; i < plan.n; i++) buy(state, "gpus", plan.card.id, m.id);
+  loadModel(state, m.id, plan.model.id, plan.quant);
+  recompute(state);
+  return { ok: true, id: m.id, plan };
 }
 
 /** Every useful thing you could do next, tried on a copy of the game and ranked by how fast it pays back. */
@@ -1207,6 +1262,16 @@ function rankMoves(state, machineId) {
     const c = part("chassis", m.chassis);
     const space = c.type === "rackmount" ? rackHasRoomFor(state, c.units) : floorUsed(state) + 1 <= floorLimit(state);
     if (space) moves.push({ id: `copy-${m.id}`, label: `Copy ${m.name}`, run: (s) => cloneMachine(s, m.id) });
+  }
+  // A size buyers want that you barely serve: the best machine built for it, picked on copies.
+  if (!fleetDominant) {
+    for (const tier of ["small", "medium", "large", "frontier"]) {
+      const v = state.stats.soldByTier?.[tier];
+      if ((v?.supply || 0) > tierDemand(state, tier) * 0.5) continue;
+      const plan = tierBuild(state, tier);
+      if (plan.problem) continue;
+      moves.push({ id: `tierbuild-${tier}`, label: `Build a machine for ${TIERS[tier].name.toLowerCase()} models: ${plan.n} x ${shortName(plan.card)}`, unlocks: `Buyers want more ${TIERS[tier].name.toLowerCase()} than you make. It runs ${plan.model.name}${plan.whole ? ", whole on each card, so every card works" : ""}.`, run: (s) => buildForTier(s, tier) });
+    }
   }
   // A fresh workstation, for when every case is full of small cards.
   if (!fleetDominant && floorUsed(state) + 1 <= floorLimit(state)) {

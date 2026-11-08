@@ -860,8 +860,23 @@ function Models({ m }) {
       if (!inTier.length) return null;
       const sold = state.stats.soldByTier[tier];
       return html`<section key=${tier} class="tiergroup"><h2 class="tier">${G.TIERS[tier].name} models. Buyers want ${tok(G.tierDemand(state, tier))} MTok a day${sold ? `, you sell ${tok(sold.sold)}` : ""}.${state.contract?.tier === tier ? ` ${state.contract.client} has a deal for this size.` : state.offer?.tier === tier ? ` ${state.offer.client} is offering a deal for this size.` : ""}</h2>
-      ${inTier.map((model) => html`<${ModelRow} key=${model.id} m=${m} model=${model} best=${bestPick?.model.id === model.id} bestQuant=${bestPick?.quant} />`)}</section>`;
+      <${TierBuild} m=${m} tier=${tier} models=${inTier} perCard=${perCard} />
+      ${inTier.map((model) => html`<${ModelRow} key=${model.id} m=${m} model=${model} best=${bestPick?.model.id === model.id} bestQuant=${bestPick?.quant} noPath=${!m.sku && tier !== "tiny" && !holdsWhole(m, inTier)} />`)}</section>`;
     })}
+  </div>`;
+}
+/** When this machine can only run a size split across cards, say why, and offer the best new machine for that size. */
+/** Whether this machine can hold some model of the size whole on one card, where every card works. */
+const holdsWhole = (m, models) => models.some((x) => Object.keys(x.sizes).some((q) => { const f = G.modelFit(state, m, x, q); return f.fits && (f.mode === "single" || f.mode === "copies"); }));
+function TierBuild({ m, tier, models, perCard }) {
+  if (m.sku || tier === "tiny" || holdsWhole(m, models)) return null;
+  const need = G.cardNeed(state, tier);
+  const plan = remembered(`tierbuild|${tier}`, () => G.tierBuild(state, tier));
+  const name = G.TIERS[tier].name.toLowerCase();
+  const build = () => { const r = G.buildForTier(state, tier); freshMoves(); if (r.ok) { ui.machineId = r.id; flashNote(`Built ${r.plan.n} x ${G.shortName(r.plan.card)} running ${r.plan.model.name}.`); } doIt(r); };
+  return html`<div class="tierbuild">
+    <p class="small d1">${G.TIERS[tier].name} models need about ${need.rough} GB on one card at rough quality, ${need.standard} GB at standard. ${perCard ? `This machine's biggest card has ${perCard} GB, so here they'd be split across cards, where only one works at a time and the slowest sets the pace.` : ""}</p>
+    ${plan.problem ? html`<p class="small d2">${plan.problem}</p>` : html`<button class="act lead" disabled=${state.cash < plan.cost} onClick=${build}>build a machine for ${name} models: ${plan.n} x ${G.shortName(plan.card)}, ${money(plan.cost)}, about +${money(plan.perDay)} a day, back in ${Math.ceil(plan.payback)} days</button>${state.cash < plan.cost ? html`<span class="small d2"> ${money(plan.cost - state.cash)} short</span>` : null}`}
   </div>`;
 }
 // fitPath and quotes try things on copies of the game, so keep the answer until the setup changes.
@@ -877,12 +892,13 @@ function remembered(key, compute) {
   return slowCache.get(key);
 }
 const HOW = { single: () => "fits on one card", copies: (f) => `${f.copies} copies, one per card`, split: (f) => `split across ${f.copies === 1 ? "cards" : "cards"}, no extra speed`, spill: () => "spills into RAM, slow" };
-function ModelRow({ m, model, best, bestQuant }) {
+function ModelRow({ m, model, best, bestQuant, noPath = false }) {
   const cur = m.modelId === model.id;
   const sparse = G.sparseRatio(model) < 1;
   const options = Object.keys(model.sizes).map((q) => ({ q, e: G.estimateEarn(state, m, model, q) }));
   const anyFits = options.some((o) => o.e.fit.fits && o.e.fit.mode !== "spill");
-  const path = !anyFits && !m.sku && m.gpus.length ? remembered(`path|${m.id}|${model.id}`, () => G.fitPath(state, m, model)) : null;
+  // Where a size only fits split, the cheapest way to make it fit is a trap; the build line above the size offers the real answer.
+  const path = !anyFits && !m.sku && m.gpus.length && !noPath ? remembered(`path|${m.id}|${model.id}`, () => G.fitPath(state, m, model)) : null;
   const follow = () => {
     if (state.cash < path.cost) {
       flash(`You need ${money(path.cost - state.cash)} more.`);
@@ -898,7 +914,7 @@ function ModelRow({ m, model, best, bestQuant }) {
     <div class="mtitle">
       <div class="nm">${cur ? html`<span class="sig">> </span>` : null}${model.name}${best ? html` <span class="tag">pays most on this machine</span>` : null}</div>
       <div class="small d2">${sparse ? `Sparse: only ${model.active}B of ${Math.round(model.params)}B parameters work per word. Fast, sells cheap.` : model.own ? "Yours." : model.goodAt}${ageNote(model) ? ` ${ageNote(model)}` : ""}</div>
-      ${path ? html`<button class="act" onClick=${follow}>to run it: ${path.label}, ${money(path.cost)}</button>` : !anyFits && !options.some((o) => o.e.fit.fits) ? html`<div class="small d2">Too big for anything you can add here. Sell a machine to free a floor spot, or move up.</div>` : null}
+      ${path ? html`<button class="act" onClick=${follow}>to run it: ${path.label}, ${money(path.cost)}</button>` : !anyFits && !options.some((o) => o.e.fit.fits) && !noPath ? html`<div class="small d2">Too big for anything you can add here. Sell a machine to free a floor spot, or move up.</div>` : null}
     </div>
     <div class="qs">
       ${options.map(({ q, e }) => {
