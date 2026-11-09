@@ -352,6 +352,22 @@ button.prodrow:focus-visible { outline: none; }
 .rule p { margin: 2px 0 0; }
 .tierbuild { display: grid; gap: 4px; justify-items: start; margin: 0 0 10px; max-width: 72ch; }
 .tierbuild p { margin: 0; }
+.investsec { margin-top: 28px; }
+.invest { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 18px clamp(18px, 2.4vw, 36px); align-items: start; }
+.lever { display: grid; gap: 4px; padding: 10px 0 0; border-top: 1px solid var(--dust); min-width: 0; }
+.leverhead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.lever p { margin: 0 0 4px; }
+.opthead, .opt { display: grid; grid-template-columns: minmax(0, 1fr) 4.6em 4.6em 4.2em; gap: 8px; align-items: baseline; }
+.opthead span:not(:first-child), .opt span:not(.oname) { text-align: right; font-variant-numeric: tabular-nums; }
+.optwrap { display: grid; justify-items: stretch; }
+.opt { width: 100%; padding-block: 3px; color: var(--ivory); text-align: left; line-height: 1.25; }
+.opt:hover, .opt:focus-visible { color: var(--signal); outline: none; }
+.opt.off, .opt.dim { color: var(--frost); }
+.opt .oname { min-width: 0; overflow-wrap: anywhere; }
+.opt .ocost, .opt .ogain, .opt .oback { font-size: var(--small); }
+.optwrap .moveall { justify-self: start; margin-bottom: 2px; }
+.staleadvice { opacity: .62; transition: opacity .2s; }
+@media (max-width: 600px) { .opthead, .opt { grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 6px; } .opt .oname { font-size: 14px; } }
 .matchbest { display: grid; gap: 4px; justify-items: start; margin: 0 0 10px; }
 .matchbest p { margin: 0; }
 .dealgiven { display: flex; flex-wrap: wrap; gap: 0 12px; align-items: baseline; }

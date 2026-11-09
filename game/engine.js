@@ -896,10 +896,16 @@ function pickModels(state, withDeal) {
   // What each unit sells now. In the living world, only output priced at least as high is ahead of a choice.
   const ranked = rankedSales(state);
   const held = new Map();
-  for (const u of allUnits(state)) if (u.output.model) held.set(u, { tier: u.output.model.tier, rate: u.output.rate ?? modelRate(state, u.output.model, u.quant), mtok: u.output.mtok });
+  // Totals per size, so a choice doesn't rescan every unit. Ranked selling also needs who's priced above, kept per size.
+  const total = {};
+  const bySize = {};
+  const hold = (u, h) => { held.set(u, h); total[h.tier] = (total[h.tier] || 0) + h.mtok; (bySize[h.tier] ||= new Set()).add(h); };
+  const drop = (u) => { const h = held.get(u); if (!h) return; held.delete(u); total[h.tier] -= h.mtok; bySize[h.tier].delete(h); };
+  for (const u of allUnits(state)) if (u.output.model) hold(u, { tier: u.output.model.tier, rate: u.output.rate ?? modelRate(state, u.output.model, u.quant), mtok: u.output.mtok });
   const fillFor = (tier, rate) => {
+    if (!ranked) return total[tier] || 0;
     let n = 0;
-    for (const h of held.values()) if (h.tier === tier && (!ranked || h.rate >= rate)) n += h.mtok;
+    for (const h of bySize[tier] || []) if (h.rate >= rate) n += h.mtok;
     return n;
   };
   const heat = thermalThrottle(state.roomC);
@@ -907,7 +913,7 @@ function pickModels(state, withDeal) {
   for (const u of allUnits(state)) {
     if (!isRunning(u) || u.task !== "serve" || u.forDeal) continue;
     const was = held.get(u);
-    held.delete(u);
+    drop(u);
     const speed = heat * (u.tuned ? 0.94 : 1) * mult * (u.sku ? (state.netRatio ?? 1) * u.racks : 1);
     let best = null;
     let bestMtok = 0;
@@ -935,9 +941,9 @@ function pickModels(state, withDeal) {
       u.quant = best.quant;
       u.output.model = best.model;
       u.output.mtok = bestMtok;
-      held.set(u, { tier: best.model.tier, rate: best.rate, mtok: bestMtok });
+      hold(u, { tier: best.model.tier, rate: best.rate, mtok: bestMtok });
     } else if (was) {
-      held.set(u, was);
+      hold(u, was);
     }
   }
   recompute(state);
@@ -1287,29 +1293,38 @@ function matchTargets(state, best) {
     .filter((m) => cardBag(m) !== cardBag(best))
     .sort((a, b) => netOf(state, a) - netOf(state, b));
 }
-/** Upgrade machine by machine, each tried first on a copy: stop at the first that fails, or that would push the site past what's safe. */
-function applyMatch(state, ids, bestId, ignoreCash = false) {
-  let done = 0;
-  let last = null;
+/** Upgrade the machines in order, re-pick models once, and check the circuit and any deal. If that's too much at once, find the
+ *  most that's safe by halving, and leave the game there. Each machine's upgrade is all or nothing. */
+function applyMatch(state, ids, bestId) {
   const onTrack = (s) => !s.contract || dealView(s, s.contract).enough;
   const dealFine = onTrack(state);
-  for (const id of ids) {
-    // The trial keeps today's grid emergency and appliance load, and re-picks models the way the real thing will.
-    const trial = { ...rehearsalCopy(state), curtail: state.curtail, spike: state.spike };
-    if (ignoreCash) trial.cash = 1e12;
-    recompute(trial);
-    last = upgradeTo(trial, trial.machines.find((x) => x.id === id), trial.machines.find((x) => x.id === bestId));
-    if (!last.ok) break;
-    optimizeModels(trial);
-    if (trial.amps >= safeAmps(trial) * 0.97) { last = { ok: false, reason: "The next one would put more on the circuit than it can safely carry." }; break; }
-    if (dealFine && !onTrack(trial)) { last = { ok: false, reason: "The next one would put your deal behind." }; break; }
-    if (!ignoreCash) {
+  const keep = snapshotParts(state);
+  const run = (k) => {
+    restoreParts(state, keep);
+    let done = 0;
+    let last = null;
+    for (const id of ids.slice(0, k)) {
       last = upgradeTo(state, state.machines.find((x) => x.id === id), state.machines.find((x) => x.id === bestId));
       if (!last.ok) break;
-    } else Object.assign(state, { cash: state.cash - (1e12 - trial.cash), machines: trial.machines, racks: trial.racks, bench: trial.bench, nextId: trial.nextId });
-    done++;
+      done++;
+    }
+    if (done) optimizeModels(state);
+    const power = state.amps < safeAmps(state) * 0.97;
+    const deal = !dealFine || onTrack(state);
+    return { done, last, safe: power && deal, why: !power ? "The next one would put more on the circuit than it can safely carry." : !deal ? "The next one would put your deal behind." : null };
+  };
+  let r = run(ids.length);
+  if (r.safe) return r;
+  let lo = 0;
+  let hi = r.done - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (run(mid).safe) lo = mid;
+    else hi = mid - 1;
   }
-  return { done, last };
+  const stop = r.why;
+  r = run(lo);
+  return { done: r.done, last: { ok: false, reason: stop || r.last?.reason } };
 }
 /** What bringing weaker machines up to the best costs and adds, following the same stopping rules as doing it. */
 export function matchPlan(state) {
@@ -1323,7 +1338,8 @@ export function matchPlan(state) {
   const base = rehearse(state, () => {});
   let done = 0;
   let stop = null;
-  const after = rehearse(state, (s) => { const r = applyMatch(s, targets.map((t) => t.id), best.id, true); done = r.done; stop = r.last; });
+  // The trial keeps today's grid emergency and appliance load, which a plain rehearsal drops.
+  const after = rehearse(state, (s) => { Object.assign(s, { curtail: state.curtail, spike: state.spike }); const r = applyMatch(s, targets.map((t) => t.id), best.id); done = r.done; stop = r.last; });
   if (!base || !after || !done) return { best, why, count: 0, ids: [], stopped: stop?.reason, low: Math.min(...nets), high: Math.max(...nets), waiting: targets.length };
   const gain = after.profit - base.profit;
   return { best, why, count: done, waiting: targets.length, stopped: done < targets.length ? stop?.reason : null, ids: targets.slice(0, done).map((t) => t.id), cost: after.cost, gain, payback: gain > 0 ? after.cost / gain : Infinity, low: Math.min(...nets), high: Math.max(...nets) };
@@ -1687,11 +1703,15 @@ function rehearse(state, action, valid) {
   action(copy);
   if (valid && !valid(copy)) return null;
   const cost = before - copy.cash;
-  for (let i = 0; i < 2; i++) {
+  // Re-pick models once and let the room settle. Pick again only if heat is slowing things, since that changes the answer.
+  optimizeModels(copy);
+  copy.roomC = copy.targetC;
+  recompute(copy);
+  if (thermalThrottle(copy.roomC) < 1) {
     optimizeModels(copy);
     copy.roomC = copy.targetC;
+    recompute(copy);
   }
-  optimizeModels(copy);
   return { profit: copy.stats.profitPerDay, cost, amps: copy.amps, limit: limitAmps(copy), cap: copy.capFactor ?? 1 };
 }
 /** Today's profit once the room settles, with the models as they are loaded now. */

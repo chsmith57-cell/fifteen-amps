@@ -1842,17 +1842,28 @@ function movesKey(m) {
 // seconds for prices, and keeps drawing with the last answer until the next one lands. If a browser can't start one, the old
 // way below takes over.
 const advice = { worker: null, ok: false, seq: 0, pending: false, key: "", at: 0, data: null };
+/** The worker marks Infinity, which JSON can't carry; put it back. */
+function unInfinity(v) {
+  if (v === "∞") return Infinity;
+  if (v === "-∞") return -Infinity;
+  if (Array.isArray(v)) return v.map(unInfinity);
+  if (v && typeof v === "object") { for (const k of Object.keys(v)) v[k] = unInfinity(v[k]); return v; }
+  return v;
+}
 function startAdvisor() {
   if (advice.worker || typeof Worker === "undefined") return;
   try {
     advice.worker = new Worker(new URL("./advisor.js", import.meta.url), { type: "module" });
     advice.ok = true;
     advice.worker.onmessage = (e) => {
-      if (e.data.seq !== advice.seq) return;
-      advice.pending = false;
-      if (e.data.error) { console.warn("advisor:", e.data.error); return; }
-      advice.data = e.data;
-      advice.at = performance.now();
+      // Any answer means the worker is alive, even if the watchdog gave up on it while the page was busy.
+      advice.ok = true;
+      if (e.data.seq !== advice.seq) { advice.pending = false; return; }
+      if (e.data.error) { advice.pending = false; console.warn("advisor:", e.data.error); return; }
+      // The moves come first and the slower advisors after; keep whichever part hasn't arrived yet from last time.
+      const { seq, phase, ...part } = unInfinity(e.data);
+      advice.data = { ...advice.data, ...part };
+      if (phase === "moves") { advice.pending = false; advice.stale = false; advice.at = performance.now(); }
       draw();
     };
     advice.worker.onerror = (e) => { console.warn("advisor stopped:", e.message); advice.ok = false; advice.pending = false; };
@@ -1864,9 +1875,11 @@ function askAdvice(m) {
   if (!advice.ok) return false;
   // A worker that never answers is as good as none: after 15 seconds, work it out on the page as before.
   if (advice.pending && performance.now() - advice.sent > 15000) {
-    console.warn("advisor never answered; working it out on the page");
+    console.warn("advisor never answered; working it out on the page until it does");
     advice.ok = false;
     advice.pending = false;
+    // Keep asking in the background: if it answers, it takes over again.
+    try { advice.seq++; advice.worker.postMessage({ seq: advice.seq, state, machineId: m.id }); } catch {}
     return false;
   }
   const key = movesKey(m);
@@ -1914,13 +1927,15 @@ function rankedMoves(m) {
   }
   return moveCache.moves;
 }
-/** After a click, drop the old advice so a move just done can't be offered again, and ask for new advice now. */
-function freshMoves() {
+/** After a click, ask for new advice now. Until it lands, keep the old list on screen, dimmed, without the move just done;
+ *  any click on it is checked fresh anyway. */
+function freshMoves(doneId = null) {
   moveCache.at = 0;
   moveCache.key = "";
   advice.key = "";
   advice.at = 0;
-  if (advice.data) advice.data = { ...advice.data, moves: [] };
+  advice.stale = true;
+  if (advice.data?.moves && doneId) advice.data = { ...advice.data, moves: advice.data.moves.filter((x) => x.id !== doneId) };
   slowCache.clear();
 }
 const GAUGE_TARGET = { network: "room", power: "room", heat: "room", noise: "room", space: "room", bill: "room", buyers: "market", rep: "market", speed: "models", memory: "models" };
@@ -2026,6 +2041,16 @@ function Markets() {
     </button>`)}
   </section>`;
 }
+// The investment dashboard: every option the advisor priced, sorted into the lever it pulls, each with its payback.
+const LEVERS = [
+  { id: "capacity", name: "Add capacity", what: "New machines and racks: more tokens to sell.", test: (id) => /^(tierbuild|build|copy|rack|order)-/.test(id) },
+  { id: "upgrade", name: "Upgrade what you have", what: "Better cards in machines you own, and the best model on each.", test: (id) => /^(gpu|swap)-/.test(id) || id === "optimize" },
+  { id: "buyers", name: "Buyers and products", what: "More people to sell to, or your own products at a premium.", test: (id) => /^(app-|restart-|team-sales)/.test(id) || /^tech-(sales|resale|sovereign|offtake)$/.test(id) },
+  { id: "power", name: "Power, cooling and space", what: "Room to grow: bigger feeds and sites, cooling, switches.", test: (id) => /^(feed|site|cool-|net-|swaprow-)/.test(id) || /tune-all$/.test(id) },
+  { id: "speed", name: "Speed and software", what: "More from the same hardware: serving tricks and the people who tune them.", test: (id) => /^(tech-|team-inference)/.test(id) },
+];
+const leverOf = (id) => LEVERS.find((l) => l.test(id))?.id || "capacity";
+const daysText = (d) => (d === 0 ? "now" : d < Infinity ? `${Math.ceil(d).toLocaleString("en-US")} d` : "no gain");
 function Status2({ m }) {
   const sit = G.situation(state);
   const shown = !state.hideMoves;
@@ -2033,28 +2058,38 @@ function Status2({ m }) {
   const designs = designGroups();
   const usable = moves.filter((x) => x.payback < Infinity && !x.trips);
   // One entry per kind of change: the options for one machine replace each other, so they'd crowd out everything else.
-  const seenKinds = new Set();
-  const paid = usable.filter((x) => {
-    if (!x.kind) return true;
-    if (seenKinds.has(x.kind)) return false;
-    seenKinds.add(x.kind);
-    return true;
-  }).slice(0, 4);
-  const extra = usable.filter((x) => !paid.includes(x)).slice(0, 12);
-  const act = (move) => () => { const r = G.doMove(state, move, m.id); freshMoves(); doIt(r); };
-  const actAll = (move) => () => { const r = G.doMoveAll(state, move, m.id); freshMoves(); if (r.ok) flashNote(`Done on ${r.done} machines.`); doIt(r); };
-  const moveItem = (x) => {
+  const firstOfKind = (list) => {
+    const seen = new Set();
+    return list.filter((x) => {
+      if (!x.kind) return true;
+      if (seen.has(x.kind)) return false;
+      seen.add(x.kind);
+      return true;
+    });
+  };
+  const paid = firstOfKind(usable).slice(0, 4);
+  const doneId = (move) => move.id;
+  const act = (move) => () => { const r = G.doMove(state, move, m.id); freshMoves(r.ok ? doneId(move) : null); doIt(r); };
+  const actAll = (move) => () => { const r = G.doMoveAll(state, move, m.id); freshMoves(r.ok ? doneId(move) : null); if (r.ok) flashNote(`Done on ${r.done} machines.`); doIt(r); };
+  const allButton = (x) => {
     const a = x.all;
-    const can = a ? Math.min(a.count, Math.floor(state.cash / Math.max(1, a.cost / a.count))) : 0;
-    return html`<div key=${x.id} class="moveitem"><button class=${`move ${state.cash >= x.cost ? "" : "off"}`} onClick=${act(x)}>
+    if (!a || a.gain <= 0.01 || a.trips) return null;
+    const can = Math.min(a.count, Math.floor(state.cash / Math.max(1, a.cost / a.count)));
+    return html`<button class="act moveall" disabled=${can < 1} onClick=${actAll(x)}>${can >= a.count ? `do all ${a.count} like it: ${money(a.cost)}, +${moneyShort(a.gain)} a day` : `do the ${can} you can afford of ${a.count}: about ${money((a.cost / a.count) * can)}, +${moneyShort((a.gain / a.count) * can)} a day`}, back in ${Math.ceil(a.payback).toLocaleString("en-US")} days</button>`;
+  };
+  const moveItem = (x) => html`<div key=${x.id} class="moveitem"><button class=${`move ${state.cash >= x.cost ? "" : "off"}`} onClick=${act(x)}>
       <span class="car">></span>
       <span class="mname">${x.label}</span>
       <span class="mstat">${x.cost ? money(x.cost) : "free"}, +${moneyShort(x.gain)} a day, back in ${x.payback === 0 ? "no time" : `${Math.ceil(x.payback).toLocaleString("en-US")} days`}</span>
       ${x.unlocks ? html`<span class="mnote">${x.unlocks}</span>` : null}
-    </button>
-    ${a && a.gain > 0.01 && !a.trips ? html`<button class="act moveall" disabled=${can < 1} onClick=${actAll(x)}>${can >= a.count ? `do all ${a.count} like it: ${money(a.cost)}, +${moneyShort(a.gain)} a day` : `do the ${can} you can afford of ${a.count}: about ${money((a.cost / a.count) * can)}, +${moneyShort((a.gain / a.count) * can)} a day`}, back in ${Math.ceil(a.payback).toLocaleString("en-US")} days</button>` : null}
-    </div>`;
-  };
+    </button>${allButton(x)}</div>`;
+  const optRow = (x) => html`<div key=${x.id} class="optwrap"><button class=${`opt ${x.payback < Infinity && !x.trips ? "" : "dim"} ${state.cash >= x.cost ? "" : "off"}`} onClick=${act(x)} title=${x.unlocks || ""}>
+      <span class="oname">${x.label}${x.trips ? html` <span class="sig">trips the breaker</span>` : null}</span>
+      <span class="ocost">${x.cost ? moneyShort(x.cost) : "free"}</span>
+      <span class=${`ogain ${x.gain > 0.01 ? "" : "d2"}`}>${x.gain > 0.01 ? `+${moneyShort(x.gain)}` : "+0"}</span>
+      <span class=${`oback ${x.payback <= 60 ? "sig" : ""}`}>${x.trips ? "-" : daysText(x.payback)}</span>
+    </button>${allButton(x)}</div>`;
+  const match = advice.ok ? adviceFor("match") : null;
   const groups = rowGroups();
   return html`<div class="wide spaced">
     <${Ledger} />
@@ -2070,18 +2105,39 @@ function Status2({ m }) {
         </div>
       </section>
       <${Markets} />
-      <section>
+      <section class=${advice.stale ? "staleadvice" : ""}>
         <div class="rowhead">
-          <h2 class="hd">Moves worth a look</h2>
+          <h2 class="hd">Best right now</h2>
           <button class="act" onClick=${() => { state.hideMoves = !state.hideMoves; draw(); }}>${shown ? "hide, I'll do the math" : "show moves"}</button>
         </div>
         ${shown ? html`
           ${paid.map(moveItem)}
-          ${extra.length ? html`<${More} id="moremoves" title=${`Other options: ${extra.length}`}>${extra.map(moveItem)}</${More}>` : null}
-          ${paid.length ? null : advice.ok && advice.pending ? html`<p class="d2" style="margin:0">Working out your moves.</p>` : html`<p class="d2" style="margin:0">Nothing you can add right now would earn more than its power costs. Compare what you make with what buyers want, or look at swapping machines for a bigger model.</p>`}
+          ${paid.length ? null : advice.ok && advice.pending && !moves.length ? html`<p class="d2" style="margin:0">Working out your moves.</p>` : html`<p class="d2" style="margin:0">Nothing you can add right now would earn more than its power costs. The options below show what each lever would do.</p>`}
         ` : html`<p class="d2" style="margin:0">Hidden. The numbers above are all you need.</p>`}
       </section>
     </div>
+    ${shown && moves.length ? html`<section class=${`investsec ${advice.stale ? "staleadvice" : ""}`}>
+      <h2 class="hd">Ways to invest, by lever. Cost, profit a day after power, and days to pay back.</h2>
+      <div class="invest">
+        ${LEVERS.map((lv) => {
+          const all = moves.filter((x) => leverOf(x.id) === lv.id).sort((a, b) => Number(!!a.trips) - Number(!!b.trips) || a.payback - b.payback || a.cost - b.cost);
+          const top = firstOfKind(all.filter((x) => x.payback < Infinity && !x.trips)).slice(0, 4);
+          const rest = all.filter((x) => !top.includes(x));
+          const showMatch = lv.id === "upgrade" && match?.count && match.gain > 0.5;
+          const bestBack = Math.min(top[0]?.payback ?? Infinity, showMatch ? match.payback : Infinity);
+          return html`<div class="lever" key=${lv.id}>
+            <div class="leverhead"><span class="d0">${lv.name}</span><span class="small d2">${bestBack < Infinity ? `best back in ${daysText(bestBack)}` : "nothing pays today"}</span></div>
+            <p class="small d2">${lv.what}</p>
+            <div class="opthead small d2"><span>option</span><span>cost</span><span>a day</span><span>back in</span></div>
+            ${showMatch ? html`<div class="optwrap"><button class="opt" onClick=${() => { const r = G.matchBest(state); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} machines up to ${match.best.name}'s spec.`); doIt(r); }}>
+              <span class="oname">Bring ${match.count} machines up to ${match.best.name}</span><span class="ocost">${moneyShort(match.cost)}</span><span class="ogain">+${moneyShort(match.gain)}</span><span class=${`oback ${match.payback <= 60 ? "sig" : ""}`}>${daysText(match.payback)}</span></button></div>` : null}
+            ${top.map(optRow)}
+            ${!top.length && !showMatch ? html`<p class="small d2" style="margin:0">Nothing here earns more than it costs to run today.</p>` : null}
+            ${rest.length ? html`<${More} id=${`lever-${lv.id}`} title=${`${rest.length} more ${rest.length === 1 ? "option" : "options"}`}>${rest.map(optRow)}</${More}>` : null}
+          </div>`;
+        })}
+      </div>
+    </section>` : null}
   </div>`;
 }
 
