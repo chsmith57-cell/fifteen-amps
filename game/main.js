@@ -131,7 +131,10 @@ function companySnapshot() {
 async function flushLog() {
   if (!playlog.db || !playlog.on || playlog.n >= 1500) return;
   const events = playlog.buf.splice(0);
-  if (!events.length && !state) return;
+  // Nothing clicked and the clock hasn't moved (paused, or the tab left open overnight): there's nothing new to record.
+  const day = state ? Math.floor(state.day) : null;
+  if (!events.length && (!state || day === playlog.lastDay)) return;
+  playlog.lastDay = day;
   try {
     await playlog.db.doc(`playlog/${playlog.session}-${String(playlog.n++).padStart(4, "0")}`).set({ session: playlog.session, sentAt: Date.now(), events, company: companySnapshot() });
   } catch {

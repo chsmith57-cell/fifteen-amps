@@ -1378,7 +1378,10 @@ export function nextMoves(state, machineId) {
 export function moveById(state, id, machineId) {
   sharedOptions = new Map();
   try {
-    return rankMoves(state, machineId ?? state.machines[0]?.id, id).find((x) => x.id === id) || null;
+    // A sales deal is priced with the racks that pay back fastest on the full list, so a click has to price the list too,
+    // or it picks different racks and the price jumps under the player's finger.
+    const needsList = TECH.some((t) => t.demand && id === `tech-${t.id}`);
+    return rankMoves(state, machineId ?? state.machines[0]?.id, needsList ? null : id).find((x) => x.id === id) || null;
   } finally {
     sharedOptions = null;
   }
@@ -1742,7 +1745,8 @@ export function doMove(state, move, machineId) {
   if (!fresh) return { ok: false, reason: "That move isn't available any more." };
   if (fresh.trips) return { ok: false, reason: `That would trip the breaker at ${fresh.amps.toFixed(1)} A.` };
   // Prices move while you look. If this costs more than what was shown, buy nothing and show the new price.
-  if (move.cost != null && fresh.cost > move.cost * 1.005 + 1) return { ok: false, stale: true, reason: `That now costs $${Math.round(fresh.cost).toLocaleString("en-US")}, up from $${Math.round(move.cost).toLocaleString("en-US")}. Nothing was bought.` };
+  // The half-percent slack is on the size of the price, so a move that pays you (a negative cost) isn't refused for nothing.
+  if (move.cost != null && fresh.cost > move.cost + Math.abs(move.cost) * 0.005 + 1) return { ok: false, stale: true, reason: `That now costs $${Math.round(fresh.cost).toLocaleString("en-US")}, up from $${Math.round(move.cost).toLocaleString("en-US")}. Nothing was bought.` };
   if (state.cash < fresh.cost) return { ok: false, reason: `You need $${Math.ceil(fresh.cost - state.cash).toLocaleString("en-US")} more.` };
   const before = state.cash;
   const done = fresh.run(state);
