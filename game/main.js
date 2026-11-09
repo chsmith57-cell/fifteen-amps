@@ -1505,6 +1505,16 @@ function Inspector({ items }) {
         ${r.free >= 4 ? html`<button class="act" onClick=${() => startMachine(true, r.index)}>build a new machine in it</button>` : null}
         <span class="small d2">Racks take rackmount cases. A tower's copy keeps its parts and gets a new case.</span>
         ${r.machines.length ? null : html`<button class="act" onClick=${() => { const res = G.sellEmptyRack(state, r.index); ui.worldSel = null; doIt(res, false); }}>sell this empty rack for ${money(r.rack.price * 0.5)}</button>`}
+        ${r.machines.length ? html`<button class=${`act ${ui.confirmRackSell === r.index ? "lead" : ""}`} onClick=${() => {
+          if (ui.confirmRackSell !== r.index) { ui.confirmRackSell = r.index; draw(); return; }
+          ui.confirmRackSell = null;
+          const res = G.sellRackAll(state, r.index);
+          ui.worldSel = null;
+          ui.machineId = state.machines[0].id;
+          freshMoves();
+          if (res.ok) flashNote(`Sold the rack and its ${res.sold} ${res.sold === 1 ? "machine" : "machines"} for ${money(res.got)}. Its floor spot is free.`);
+          doIt(res, false);
+        }}>${ui.confirmRackSell === r.index ? `yes, sell the rack and all ${r.machines.length} machines for ${money(G.rackSaleValue(state, r.index))}` : `sell this rack and the ${r.machines.length} ${r.machines.length === 1 ? "machine" : "machines"} in it`}</button>` : null}
         ${close}
       </div>
     </aside>`;

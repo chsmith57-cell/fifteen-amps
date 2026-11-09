@@ -275,6 +275,29 @@ export function rackHasRoomFor(state, units, except) {
   return rackPlan(state, except).some((r) => r.free >= units);
 }
 /** An empty rack can go back, freeing its floor spot. */
+/** What selling a rack and every machine in it brings in. */
+export function rackSaleValue(state, index) {
+  const r = rackPlan(state)[index];
+  if (!r) return 0;
+  return Math.round(r.rack.price * 0.5) + r.machines.reduce((n, { m }) => n + machineResale(state, m), 0);
+}
+/** Sell a rack and every machine in it, in one go, to free its floor spot. Machines on a deal stay put. */
+export function sellRackAll(state, index) {
+  const r = rackPlan(state)[index];
+  if (!r) return { ok: false, reason: "That rack is gone." };
+  if (r.machines.some(({ m }) => m.forDeal)) return { ok: false, reason: "A machine in this rack is working on your deal. Take it back from the deal first." };
+  const before = state.cash;
+  for (const { m } of r.machines) {
+    state.cash += machineResale(state, m);
+    state.machines = state.machines.filter((x) => x !== m);
+  }
+  if (!state.machines.length) addMachine(state);
+  state.cash += Math.round(r.rack.price * 0.5);
+  state.racks.splice(index, 1);
+  for (const m of state.machines) if (m.rackSlot > index) m.rackSlot -= 1;
+  optimizeModels(state);
+  return { ok: true, sold: r.machines.length, got: state.cash - before };
+}
 export function sellEmptyRack(state, index) {
   const r = rackPlan(state)[index];
   if (!r || r.machines.length) return { ok: false, reason: "Take the machines out of it first." };
