@@ -2073,6 +2073,12 @@ function fillDefaults(state) {
   state.rules ||= { gens: false, market: false, supply: false };
   // What hires are paid against, until the first tick sets it properly.
   state.salesRef ??= state.stats?.revenuePerDay || 0;
+  // A big company that tripped before version 28 couldn't reach the button to flip it back: its trip screen ran off the top.
+  // Give back what that trip and the outage took, once, when it flips back on.
+  if (!state.fixes?.tripScreen) {
+    state.fixes = { ...state.fixes, tripScreen: true };
+    if (state.tripped && state.lastTrip && state.rows.length === 0 && state.machines.length > 12) state.repairTrip = true;
+  }
   state.world ||= { gen: 0, next: null, W: null, boost: {}, orders: [], dock: {} };
   if (ruleOn(state, "market") && !state.world.W) initMarket(state);
   // Orders saved before the monthly record existed still count this month.
@@ -2781,6 +2787,11 @@ export function moveBack(state) {
 export function resetBreaker(state) {
   if (!state.tripped) return;
   state.tripped = false;
+  if (state.repairTrip) {
+    state.rep = Math.min(1, state.rep + 0.05 + 0.0015 * Math.max(0, state.day - (state.lastTrip?.day ?? state.day)));
+    delete state.repairTrip;
+    say(state, "SORRY ABOUT THAT TRIP SCREEN. YOUR REPUTATION IS BACK WHERE IT WAS.", "good");
+  }
   say(state, "You flip the breaker back on. The fans spin up.", "info");
   recompute(state);
   if (state.amps >= limitAmps(state)) trip(state);

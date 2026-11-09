@@ -445,7 +445,7 @@ button.bookrow:focus-visible { outline: none; }
 .wide { -webkit-mask-image: linear-gradient(#000 calc(100% - 26px), transparent); mask-image: linear-gradient(#000 calc(100% - 26px), transparent); }
 
 /* Moments */
-.takeover { position: fixed; inset: 0; z-index: 5; display: grid; place-content: center; justify-items: start; gap: 16px; padding-block: 24px; padding-left: max(var(--gutter), env(safe-area-inset-left, 0px)); padding-right: max(var(--gutter), env(safe-area-inset-right, 0px)); background: rgba(0, 0, 0, .86); overflow-y: auto; }
+.takeover { position: fixed; inset: 0; z-index: 5; display: grid; place-content: start; justify-items: start; padding-top: max(24px, 8vh); gap: 16px; padding-block: 24px; padding-left: max(var(--gutter), env(safe-area-inset-left, 0px)); padding-right: max(var(--gutter), env(safe-area-inset-right, 0px)); background: rgba(0, 0, 0, .86); overflow-y: auto; }
 .takeover h2 { font-size: clamp(40px, 9vw, 150px); line-height: .98; margin: 0; font-weight: normal; letter-spacing: 0; text-shadow: .045em 0 currentColor, 0 .03em currentColor, .045em .03em currentColor; }
 .takeover p { margin: 0; max-width: 58ch; color: var(--bone); }
 .tripped .shell { filter: brightness(.38); }
