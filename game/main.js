@@ -870,7 +870,7 @@ function MatchBest() {
   if (state.machines.length < 2) return null;
   const plan = advice.ok ? adviceFor("match") : remembered("matchbest", () => G.matchPlan(state));
   if (!plan || !plan.waiting) return null;
-  const go = () => { const r = G.matchBest(state); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} of ${r.of} ${r.of === 1 ? "machine" : "machines"} up to ${plan.best.name}'s spec.`); doIt(r); };
+  const go = () => { const r = G.matchBest(state, plan); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} of ${r.of} ${r.of === 1 ? "machine" : "machines"} up to ${plan.best.name}'s spec.`); doIt(r); };
   const short = plan.count && state.cash < plan.cost;
   const n = plan.count;
   return html`<div class="matchbest">
@@ -1505,8 +1505,8 @@ function Inspector({ items }) {
         ${r.free >= 4 ? html`<button class="act" onClick=${() => startMachine(true, r.index)}>build a new machine in it</button>` : null}
         <span class="small d2">Racks take rackmount cases. A tower's copy keeps its parts and gets a new case.</span>
         ${r.machines.length ? null : html`<button class="act" onClick=${() => { const res = G.sellEmptyRack(state, r.index); ui.worldSel = null; doIt(res, false); }}>sell this empty rack for ${money(r.rack.price * 0.5)}</button>`}
-        ${r.machines.length ? html`<button class=${`act ${ui.confirmRackSell === r.index ? "lead" : ""}`} onClick=${() => {
-          if (ui.confirmRackSell !== r.index) { ui.confirmRackSell = r.index; draw(); return; }
+        ${r.machines.length ? html`<button class=${`act ${ui.confirmRackSell === rackKey(r) ? "lead" : ""}`} onClick=${() => {
+          if (ui.confirmRackSell !== rackKey(r)) { ui.confirmRackSell = rackKey(r); draw(); return; }
           ui.confirmRackSell = null;
           const res = G.sellRackAll(state, r.index);
           ui.worldSel = null;
@@ -1514,7 +1514,7 @@ function Inspector({ items }) {
           freshMoves();
           if (res.ok) flashNote(`Sold the rack and its ${res.sold} ${res.sold === 1 ? "machine" : "machines"} for ${money(res.got)}. Its floor spot is free.`);
           doIt(res, false);
-        }}>${ui.confirmRackSell === r.index ? `yes, sell the rack and all ${r.machines.length} machines for ${money(G.rackSaleValue(state, r.index))}` : `sell this rack and the ${r.machines.length} ${r.machines.length === 1 ? "machine" : "machines"} in it`}</button>` : null}
+        }}>${ui.confirmRackSell === rackKey(r) ? `yes, sell the rack and all ${r.machines.length} machines for ${money(G.rackSaleValue(state, r.index))}` : `sell this rack and the ${r.machines.length} ${r.machines.length === 1 ? "machine" : "machines"} in it`}</button>` : null}
         ${close}
       </div>
     </aside>`;
@@ -1713,6 +1713,14 @@ function Room() {
   return html`<div class="wide spaced floorpage"><${World} tabs=${tabs} panels=${panels} /></div>`;
 }
 
+/** A training run nothing is working on: say so, and offer to pick it back up. */
+function Stalled() {
+  const p = state.project;
+  if (!p || state.tripped || G.projectPower(state) > 0) return null;
+  return html`<div class="worldstrip"><div><span class="sig">${G.TRAINING[p.kind].name} is stuck at ${Math.floor((p.work / p.need) * 100)}%: nothing is working on it, usually because its machine was sold or switched off.</span> <button class="act lead" onClick=${() => { const r = G.resumeProject(state); freshMoves(); if (r.ok) flashNote(`Training again on ${r.units.join(", ")}.`); doIt(r); }}>pick it back up on your weakest machine that can</button></div></div>`;
+}
+/** A rack's identity for a confirm step: its machines, so a confirm can't carry to another rack after one is sold. */
+const rackKey = (r) => r.machines.map(({ m }) => m.id).join(",");
 // ---- Lab layer ----
 function Lab({ m }) {
   const p = state.project;
@@ -1800,7 +1808,7 @@ function Lab({ m }) {
     <section>
       <h2 class="hd">Make your own AI</h2>
       <p class="d1" style="margin:0 0 12px;max-width:60ch">Everything so far has been someone else's model. These jobs take machines off paid work and aim them at a model that belongs to you.</p>
-      ${p ? html`<p class="d0" style="margin:0 0 6px">${spec.name}: ${Math.floor((p.work / p.need) * 100)}% done.</p><${Bar} value=${p.work / p.need} /><button class="act" style="margin-top:8px" onClick=${() => { G.cancelProject(state); draw(); }}>stop and go back to earning</button>` : html`
+      ${p ? html`<p class="d0" style="margin:0 0 6px">${spec.name}: ${Math.floor((p.work / p.need) * 100)}% done.</p><${Bar} value=${p.work / p.need} /><${Stalled} /><button class="act" style="margin-top:8px" onClick=${() => { G.cancelProject(state); draw(); }}>stop and go back to earning</button>` : html`
         <div style="margin-bottom:14px">
           <div class="d0">Fine-tune a model${tune.made ? `, number ${tune.made + 1}` : ""}</div>
           <div class="d1">Makes one new model that you own and any machine or rack can load. It's not an upgrade to a machine, so you don't repeat it per machine. This one sells at ${tune.premium}x the price${tune.made ? " and takes longer than your last" : ""}. One machine with ${tune.minVram} GB of GPU memory does the work.</div>
@@ -1858,7 +1866,8 @@ function startAdvisor() {
     advice.worker.onmessage = (e) => {
       // Any answer means the worker is alive, even if the watchdog gave up on it while the page was busy.
       advice.ok = true;
-      if (e.data.seq !== advice.seq) { advice.pending = false; return; }
+      // An answer to an older request is out of date: ignore it, and leave the newer request waiting.
+      if (e.data.seq !== advice.seq) return;
       if (e.data.error) { advice.pending = false; console.warn("advisor:", e.data.error); return; }
       // The moves come first and the slower advisors after; keep whichever part hasn't arrived yet from last time.
       const { seq, phase, ...part } = unInfinity(e.data);
@@ -1935,6 +1944,9 @@ function freshMoves(doneId = null) {
   advice.key = "";
   advice.at = 0;
   advice.stale = true;
+  // Anything already on its way describes the game before this click.
+  advice.seq++;
+  advice.pending = false;
   if (advice.data?.moves && doneId) advice.data = { ...advice.data, moves: advice.data.moves.filter((x) => x.id !== doneId) };
   slowCache.clear();
 }
@@ -2026,7 +2038,7 @@ function Ledger() {
   const l = G.ledger(state);
   const part = (name, n, cls = "") => html`<span class=${`lpart ${cls}`}><span class="lname">${name}</span><span class="lnum">${moneyShort(n)}</span></span>`;
   return html`<div class="ledger" role="group" aria-label="Today's money">
-    ${part("Sales", l.sales)}<span class="lop">-</span>${part(l.machines && state.rows.length ? "Power: racks and machines" : "Power: machines", l.machines)}<span class="lop">-</span>${part("Power: cooling", l.cooling, l.cooling > l.machines ? "sig" : "")}${l.other > 0.01 ? html`<span class="lop">-</span>${part("Power: network", l.other)}` : null}${l.rent ? html`<span class="lop">-</span>${part(state.rows.length ? "Rent and contracts" : "Rent", l.rent)}` : null}${l.staff ? html`<span class="lop">-</span>${part("Salaries and upkeep", l.staff)}` : null}<span class="lop">=</span>${part("Profit a day", l.profit, l.profit < 0 ? "sig" : "")}
+    ${part("Sales", l.sales)}${l.lease > 0.5 ? html`<span class="lop">+</span>${part("Rental desk", l.lease, "sig")}` : null}<span class="lop">-</span>${part(l.machines && state.rows.length ? "Power: racks and machines" : "Power: machines", l.machines)}<span class="lop">-</span>${part("Power: cooling", l.cooling, l.cooling > l.machines ? "sig" : "")}${l.other > 0.01 ? html`<span class="lop">-</span>${part("Power: network", l.other)}` : null}${l.rent ? html`<span class="lop">-</span>${part(state.rows.length ? "Rent and contracts" : "Rent", l.rent)}` : null}${l.staff ? html`<span class="lop">-</span>${part("Salaries and upkeep", l.staff)}` : null}<span class="lop">=</span>${part("Profit a day", l.profit, l.profit < 0 ? "sig" : "")}
   </div>`;
 }
 function Markets() {
@@ -2086,7 +2098,7 @@ function Status2({ m }) {
   const optRow = (x) => html`<div key=${x.id} class="optwrap"><button class=${`opt ${x.payback < Infinity && !x.trips ? "" : "dim"} ${state.cash >= x.cost ? "" : "off"}`} onClick=${act(x)} title=${x.unlocks || ""}>
       <span class="oname">${x.label}${x.trips ? html` <span class="sig">trips the breaker</span>` : null}</span>
       <span class="ocost">${x.cost ? moneyShort(x.cost) : "free"}</span>
-      <span class=${`ogain ${x.gain > 0.01 ? "" : "d2"}`}>${x.gain > 0.01 ? `+${moneyShort(x.gain)}` : "+0"}</span>
+      <span class=${`ogain ${x.gain > 0.01 ? "" : "d2"}`}>${x.gain > 0.01 ? `+${moneyShort(x.gain)}` : x.gain < -0.01 ? `-${moneyShort(-x.gain)}` : "0"}</span>
       <span class=${`oback ${x.payback <= 60 ? "sig" : ""}`}>${x.trips ? "-" : daysText(x.payback)}</span>
     </button>${allButton(x)}</div>`;
   const match = advice.ok ? adviceFor("match") : null;
@@ -2094,6 +2106,7 @@ function Status2({ m }) {
   return html`<div class="wide spaced">
     <${Ledger} />
     <div class="gauges">${sit.rows.map((r) => html`<${Gauge} key=${r.id} r=${r} />`)}</div>
+    <${Stalled} />
     <${WorldStrip} />
     <div class="statusrow">
       <section>
@@ -2129,7 +2142,7 @@ function Status2({ m }) {
             <div class="leverhead"><span class="d0">${lv.name}</span><span class="small d2">${bestBack < Infinity ? `best back in ${daysText(bestBack)}` : "nothing pays today"}</span></div>
             <p class="small d2">${lv.what}</p>
             <div class="opthead small d2"><span>option</span><span>cost</span><span>a day</span><span>back in</span></div>
-            ${showMatch ? html`<div class="optwrap"><button class="opt" onClick=${() => { const r = G.matchBest(state); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} machines up to ${match.best.name}'s spec.`); doIt(r); }}>
+            ${showMatch ? html`<div class="optwrap"><button class="opt" onClick=${() => { const r = G.matchBest(state, match); freshMoves(); if (r.ok) flashNote(`Brought ${r.done} machines up to ${match.best.name}'s spec.`); doIt(r); }}>
               <span class="oname">Bring ${match.count} machines up to ${match.best.name}</span><span class="ocost">${moneyShort(match.cost)}</span><span class="ogain">+${moneyShort(match.gain)}</span><span class=${`oback ${match.payback <= 60 ? "sig" : ""}`}>${daysText(match.payback)}</span></button></div>` : null}
             ${top.map(optRow)}
             ${!top.length && !showMatch ? html`<p class="small d2" style="margin:0">Nothing here earns more than it costs to run today.</p>` : null}

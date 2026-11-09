@@ -286,6 +286,14 @@ export function sellRackAll(state, index) {
   const r = rackPlan(state)[index];
   if (!r) return { ok: false, reason: "That rack is gone." };
   if (r.machines.some(({ m }) => m.forDeal)) return { ok: false, reason: "A machine in this rack is working on your deal. Take it back from the deal first." };
+  if (state.contract && dealView(state, state.contract).enough) {
+    const trial = rehearsalCopy(state);
+    recompute(trial);
+    const ids = new Set(r.machines.map(({ m }) => m.id));
+    trial.machines = trial.machines.filter((x) => !ids.has(x.id));
+    optimizeModels(trial);
+    if (!dealView(trial, trial.contract).enough) return { ok: false, reason: `Selling it would put the ${state.contract.client} deal behind. Finish the deal first, or give it other machines.` };
+  }
   const before = state.cash;
   for (const { m } of r.machines) {
     state.cash += machineResale(state, m);
@@ -457,13 +465,14 @@ export function dollarsPerDay(state, watts) {
 }
 /** The whole company's day: what comes in, and each thing it goes to. */
 export function ledger(state) {
-  const sales = state.stats.revenuePerDay || 0;
+  const lease = state.stats.leasePerDay || 0;
+  const sales = (state.stats.revenuePerDay || 0) - lease;
   const machines = state.machines.reduce((n, m) => n + dollarsPerDay(state, m.output?.wall || 0), 0);
   const racks = state.rows.reduce((n, r) => n + dollarsPerDay(state, r.output?.wall || 0), 0);
   const total = state.stats.powerPerDay || 0;
   const cooling = state.tripped ? 0 : Math.min(Math.max(0, total - machines - racks), state.cooling.reduce((n, id) => n + dollarsPerDay(state, by(COOLING, id).drawW), 0));
   const rent = (state.stats.rentPerDay || 0) + (state.stats.capacityPerDay || 0) + (state.stats.supportPerDay || 0);
-  return { sales, machines: machines + racks, cooling, other: Math.max(0, total - machines - racks - cooling), rent, staff: state.stats.staffPerDay || 0, profit: state.stats.profitPerDay || 0 };
+  return { sales, lease, machines: machines + racks, cooling, other: Math.max(0, total - machines - racks - cooling), rent, staff: state.stats.staffPerDay || 0, profit: state.stats.profitPerDay || 0 };
 }
 /** Each size of model as a market: what buyers want, what you make, what you sell. */
 export function markets(state) {
@@ -1042,7 +1051,7 @@ export function situation(state) {
   const endedDeal = TECH.find((t) => t.demand && hasTech(state, t.id) && !techActive(state, t.id) && techAvailable(state, t));
   const buyersFix = endedDeal ? `Restart ${endedDeal.name.toLowerCase()} in the lab, or serve another size.` : moreBuyers ? `Buy ${moreBuyers.name.toLowerCase()}, or serve another size.` : "Serve a different size of model.";
   rows.push({
-    note: unsold > 0.5 ? `${moneyText(unsold)} a day goes unsold` : "everything you make sells", id: "buyers", name: "Buyers", value: `${Math.round(supplyTotal ? (soldTotal / supplyTotal) * 100 : 0)}% sold`, limit: null, ratio: supplyTotal ? soldTotal / supplyTotal : 0,
+    note: unsold > 0.5 ? (state.stats.leasePerDay > 0.5 ? `${moneyText(unsold)} unsold, renting for ${moneyText(state.stats.leasePerDay)}` : `${moneyText(unsold)} a day goes unsold`) : state.stats.leasePerDay > 0.5 ? `all sells, idle cards rent ${moneyText(state.stats.leasePerDay)}` : "everything you make sells", id: "buyers", name: "Buyers", value: `${Math.round(supplyTotal ? (soldTotal / supplyTotal) * 100 : 0)}% sold`, limit: null, ratio: supplyTotal ? soldTotal / supplyTotal : 0,
     status: unsold > s.revenuePerDay * 0.15 ? "limit" : unsold > 0.5 ? "near" : "ok",
     effect: unsold > 0.5 ? (fleetOn ? `${moneyText(unsold)} a day of tokens goes unsold. ${buyersFix}` : `${TIERS[unsoldTier].name}-model buyers are full. ${moneyText(unsold)} a day of tokens goes unsold. Move a machine to a different size of model.`) : "Everything you make sells. Each model size has its own buyers.",
   });
@@ -1240,7 +1249,8 @@ function snapshotParts(state) {
   return { cash: state.cash, machines: c.machines, racks: c.racks, bench: c.bench, nextId: state.nextId };
 }
 function restoreParts(state, keep) {
-  Object.assign(state, keep);
+  // Always from a fresh copy, so a snapshot used twice can't carry changes made after the first restore.
+  Object.assign(state, { cash: keep.cash, nextId: keep.nextId, racks: [...keep.racks], bench: [...keep.bench], machines: keep.machines.map((m) => ({ ...m, psus: [...m.psus], memory: [...m.memory], gpus: m.gpus.map((g) => ({ ...g })), output: null })) });
   recompute(state);
 }
 
@@ -1345,9 +1355,10 @@ export function matchPlan(state) {
   return { best, why, count: done, waiting: targets.length, stopped: done < targets.length ? stop?.reason : null, ids: targets.slice(0, done).map((t) => t.id), cost: after.cost, gain, payback: gain > 0 ? after.cost / gain : Infinity, low: Math.min(...nets), high: Math.max(...nets) };
 }
 /** Do it for real, worst machine first, as far as the money and the circuit go. */
-export function matchBest(state) {
+export function matchBest(state, quoted = null) {
   const plan = matchPlan(state);
   if (!plan?.count) return { ok: false, reason: plan?.stopped || "Every machine already matches your best one." };
+  if (quoted && (plan.count !== quoted.count || plan.cost > quoted.cost * 1.005 + 1)) return { ok: false, stale: true, reason: `That's now ${plan.count} machines for $${Math.round(plan.cost).toLocaleString("en-US")}. Nothing was bought; the new quote is showing.` };
   const { done, last } = applyMatch(state, plan.ids, plan.best.id);
   if (!done) return last || { ok: false, reason: "Nothing could be upgraded." };
   optimizeModels(state);
@@ -1705,9 +1716,10 @@ function rehearse(state, action, valid) {
   const cost = before - copy.cash;
   // Re-pick models once and let the room settle. Pick again only if heat is slowing things, since that changes the answer.
   optimizeModels(copy);
+  const heatBefore = thermalThrottle(copy.roomC);
   copy.roomC = copy.targetC;
   recompute(copy);
-  if (thermalThrottle(copy.roomC) < 1) {
+  if (thermalThrottle(copy.roomC) < 1 || thermalThrottle(copy.roomC) !== heatBefore) {
     optimizeModels(copy);
     copy.roomC = copy.targetC;
     recompute(copy);
@@ -1754,6 +1766,8 @@ function rehome(state, m, chassisId) {
 export function doMoveAll(state, move, machineId) {
   const fresh = moveById(state, move.id, machineId);
   if (!fresh?.all) return { ok: false, reason: "That move isn't available any more." };
+  if (fresh.all.trips) return { ok: false, reason: "Doing all of them now would trip the breaker." };
+  if (move.all?.cost != null && fresh.all.cost > move.all.cost * 1.005 + 1) return { ok: false, stale: true, reason: `That now costs $${Math.round(fresh.all.cost).toLocaleString("en-US")}. Nothing was bought.` };
   let done = 0;
   const cards = (st, id) => st.machines.find((x) => x.id === id)?.gpus.map((g) => g.id).join();
   for (const id of fresh.group) {
@@ -1906,7 +1920,8 @@ export const APP_LEVELS = 6;
 const appBase = (app, level) => TIERS[app.tier].demand * 0.6 * Math.pow(2, level - 1);
 const appGrowth = (state) => 1 + state.day / 500;
 export const appLevel = (state, id) => state.apps?.[id]?.level || 0;
-export const appNextCost = (state, id) => by(APPS, id).cost * Math.pow(3, appLevel(state, id));
+// Each version doubles its buyers and doubles its price, so a later version pays back about as fast as the launch did.
+export const appNextCost = (state, id) => by(APPS, id).cost * Math.pow(2, appLevel(state, id));
 export const appAvailable = (state, app) => siteAtLeast(state, app.site);
 /** What this product's users want now, and at its next version, in MTok a day. */
 export function appDemand(state, tier) {
@@ -2120,7 +2135,7 @@ function fillDefaults(state) {
   // Give back what that trip and the outage took, once, when it flips back on.
   if (!state.fixes?.tripScreen) {
     state.fixes = { ...state.fixes, tripScreen: true };
-    if (state.tripped && state.lastTrip && state.rows.length === 0 && state.machines.length > 12) state.repairTrip = true;
+    if (state.tripped && state.lastTrip && state.rows.length === 0 && state.machines.filter((m) => m.on !== false && isComplete(m)).length > 12) state.repairTrip = true;
   }
   state.world ||= { gen: 0, next: null, W: null, boost: {}, orders: [], dock: {} };
   if (ruleOn(state, "market") && !state.world.W) initMarket(state);
@@ -2305,13 +2320,16 @@ export function recompute(state, ignore = {}) {
     mtok += toContract + toApps + market;
   }
   // The rental desk: whatever cards buyers left idle earn about a third of their price a year.
+  let leaseRevenue = 0;
   if (leased) {
     for (const u of [...running, ...liveRows]) {
       if (u.task !== "serve") continue;
       const cards = u.sku ? rackPrice(state, skuOf(u)) * u.racks * capFactor : u.gpus.reduce((n, g) => n + priceOf(state, "gpus", part("gpus", g.id)), 0);
       const rent = (cards / 1000) * (1 - (u.output.mtok ? (u.output.util ?? 0) * (u.output.fit?.used ?? 1) : 0));
       u.output.revenue = (u.output.revenue || 0) + rent;
+      u.output.rent = rent;
       revenue += rent;
+      leaseRevenue += rent;
     }
   }
   const busyNow = (u) => (u.task !== "serve" || leased ? 1 : u.output.mtok ? u.output.util ?? 0 : 0);
@@ -2338,7 +2356,7 @@ export function recompute(state, ignore = {}) {
   const capacityPerDay = feed ? ((feed.amps * volts) / 1e6) * CAPACITY_PER_MW_DAY : 0;
   const supportPerDay = state.rows.reduce((n, r) => n + (skuOf(r).price * r.racks * SUPPORT_PER_YEAR) / 365, 0);
   const staffPerDay = salaryPerDay(state) + appsPerDay(state) + teamPerDay(state);
-  state.stats = { revenuePerDay: revenue, powerPerDay, capacityPerDay, supportPerDay, staffPerDay, rentPerDay: site(state).rent, mtokPerDay: mtok, soldByTier: sold, profitPerDay: revenue - powerPerDay - capacityPerDay - supportPerDay - staffPerDay - site(state).rent };
+  state.stats = { revenuePerDay: revenue, leasePerDay: leaseRevenue, powerPerDay, capacityPerDay, supportPerDay, staffPerDay, rentPerDay: site(state).rent, mtokPerDay: mtok, soldByTier: sold, profitPerDay: revenue - powerPerDay - capacityPerDay - supportPerDay - staffPerDay - site(state).rent };
 }
 
 // ---- The living world: three rules, each switchable on its own (DESIGN.md, "A living world") ----
@@ -2831,7 +2849,9 @@ export function resetBreaker(state) {
   if (!state.tripped) return;
   state.tripped = false;
   if (state.repairTrip) {
-    state.rep = Math.min(1, state.rep + 0.05 + 0.0015 * Math.max(0, state.day - (state.lastTrip?.day ?? state.day)));
+    // The trip's 5 points plus what the outage slid, never more than it could have; a recorded value wins.
+    const slid = Math.min(0.0015 * Math.max(0, state.day - (state.lastTrip?.day ?? state.day)), 0.3);
+    state.rep = state.lastTrip?.rep != null ? Math.max(state.rep, state.lastTrip.rep) : Math.min(1, state.rep + 0.05 + slid);
     delete state.repairTrip;
     say(state, "SORRY ABOUT THAT TRIP SCREEN. YOUR REPUTATION IS BACK WHERE IT WAS.", "good");
   }
@@ -2840,7 +2860,7 @@ export function resetBreaker(state) {
   if (state.amps >= limitAmps(state)) trip(state);
 }
 function trip(state, fault = null) {
-  state.lastTrip = { day: state.day, total: state.amps, limit: limitAmps(state), ...state.load, spikeName: state.spike ? state.spike.name || "an appliance" : null, fault };
+  state.lastTrip = { day: state.day, rep: state.rep, total: state.amps, limit: limitAmps(state), ...state.load, spikeName: state.spike ? state.spike.name || "an appliance" : null, fault };
   state.tripped = true;
   state.trips += 1;
   state.rep = Math.max(0.05, state.rep - 0.05);
@@ -3035,6 +3055,27 @@ export function startProject(state, kind, machineIds) {
   say(state, `${spec.name}: started. Those machines stop earning until it's done.`, "good");
   recompute(state);
   return { ok: true };
+}
+/** What's training right now: zero means the run is stalled, usually because its machine was sold or switched off. */
+export function projectPower(state) {
+  if (!state.project) return 0;
+  return state.machines.filter((m) => m.task !== "serve" && isRunning(m)).reduce((n, m) => n + m.gpus.reduce((k, g) => k + part("gpus", g.id).bandwidth, 0), 0)
+    + state.rows.filter((r) => r.task !== "serve" && r.on).reduce((n, r) => n + skuOf(r).cards * skuOf(r).bandwidth * r.racks, 0);
+}
+/** Pick a stalled run back up, keeping its progress: on the weaker half for a big model, or the weakest machine with enough memory for a fine-tune. */
+export function resumeProject(state) {
+  const p = state.project;
+  if (!p) return { ok: false, reason: "Nothing is training." };
+  const spec = trainingSpec(state, p.kind, p.gen);
+  const able = allUnits(state).filter((u) => u.task === "serve" && (u.sku ? u.on : isRunning(u)) && totalVram(u) >= spec.minVram);
+  if (!able.length) return { ok: false, reason: `Nothing running has ${spec.minVram.toLocaleString("en-US")} GB of GPU memory to train it on.` };
+  const kw = (u) => (u.sku ? skuOf(u).kW * u.racks : dcLoad(u) / 1000) || 1;
+  able.sort((a, b) => (a.output?.revenue || 0) / kw(a) - (b.output?.revenue || 0) / kw(b));
+  const pick = p.kind === "finetune" ? able.slice(0, 1) : able.slice(0, Math.max(1, Math.ceil(able.length / 2)));
+  for (const u of pick) u.task = p.kind;
+  say(state, `TRAINING PICKED BACK UP AT ${Math.floor((p.work / p.need) * 100)}% ON ${pick.length === 1 ? pick[0].name.toUpperCase() : `${pick.length} UNITS`}.`, "good");
+  recompute(state);
+  return { ok: true, units: pick.map((u) => u.name) };
 }
 export function cancelProject(state) {
   for (const m of allUnits(state)) m.task = "serve";
